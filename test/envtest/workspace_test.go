@@ -571,28 +571,24 @@ func TestRouterRoleGrantsExactlyWhatTheRouterDoes(t *testing.T) {
 	sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: app.Name + "-router", Namespace: ns}}
 	mustCreate(t, sa)
 
-	// TEMPORARY hand-written fixture. Task 12 Step 1 replaces this Role with
-	// the chart-rendered one; until then this test can only assert the
-	// fixture's own rules, not the rules that ship. See
-	// task-6-brief.md's note on why that is deliberate.
+	// Chart-rendered, not a hand-written fixture: Task 12 renders this exact
+	// Role (charts/per-user-container-operator/templates/router-role.yaml)
+	// and this test applies it against a real impersonated client, so a
+	// chart Role missing (for example) workspaces/status patch fails HERE
+	// rather than shipping green against a fixture that only ever asserted
+	// itself. See task-6-brief.md's original note on why the fixture was
+	// temporary, and task-12-brief.md Files for this replacement being
+	// authorised explicitly.
 	//
 	// services carries "watch" alongside get/list: the router's Resolver
 	// (internal/router/resolve.go) calls client.WithWatch.Watch on Services
 	// to invalidate its address cache on delete, not merely List. A Role
 	// granting only get/list 403s that watch, cache invalidation never
 	// fires, addresses go stale, and a recycled ClusterIP routes one user's
-	// request into another user's container -- a real bug this fixture
-	// shipped with (Task 10) and the watch assertions below exist
+	// request into another user's container -- a real bug the fixture this
+	// replaces shipped with (Task 10) and the watch assertions below exist
 	// specifically to keep it from regressing silently.
-	role := &rbacv1.Role{
-		ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.RouterRoleName, Namespace: ns},
-		Rules: []rbacv1.PolicyRule{
-			{APIGroups: []string{v1alpha1.GroupVersion.Group}, Resources: []string{"workspaces"}, Verbs: []string{"get", "list", "watch", "create"}},
-			{APIGroups: []string{v1alpha1.GroupVersion.Group}, Resources: []string{"workspaces/status"}, Verbs: []string{"get", "patch"}},
-			{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "list", "watch"}},
-			{APIGroups: []string{"discovery.k8s.io"}, Resources: []string{"endpointslices"}, Verbs: []string{"list"}},
-		},
-	}
+	role := renderRouterRoleFromChart(t, ns)
 	mustCreate(t, role)
 	binding := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: app.Name + "-router", Namespace: ns},
