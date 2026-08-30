@@ -7,8 +7,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -24,6 +27,12 @@ import (
 	"github.com/kettleofketchup/per-user-container-operator/internal/metrics"
 	"github.com/kettleofketchup/per-user-container-operator/internal/router"
 )
+
+// shutdownTimeout bounds how long runRouter waits, on SIGTERM/SIGINT, for
+// http.Server.Shutdown to drain idle connections and in-flight NON-hijacked
+// requests before returning regardless. See runRouter's doc comment for
+// what this deliberately does NOT wait for.
+const shutdownTimeout = 15 * time.Second
 
 func run(argv []string) error {
 	if len(argv) < 2 {
@@ -171,11 +180,69 @@ func runRouter(args []string) error {
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.HandlerFor(metrics.Gatherer(), promhttp.HandlerOpts{}))
-	metricsServer := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
-	go func() { _ = metricsServer.ListenAndServe() }()
+	metricsServer := &http.Server{Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+	proxyServer := &http.Server{Handler: srv, ReadHeaderTimeout: 5 * time.Second}
 
-	proxyServer := &http.Server{Addr: cfg.ListenAddr, Handler: srv, ReadHeaderTimeout: 5 * time.Second}
-	return proxyServer.ListenAndServe()
+	metricsLn, err := net.Listen("tcp", cfg.MetricsAddr)
+	if err != nil {
+		return fmt.Errorf("listen metrics: %w", err)
+	}
+	proxyLn, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return fmt.Errorf("listen proxy: %w", err)
+	}
+
+	sigCtx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+
+	return serveAndAwaitShutdown(metricsLn, proxyLn, metricsServer, proxyServer, sigCtx.Done(), shutdownTimeout)
+}
+
+// serveAndAwaitShutdown starts metricsServer and proxyServer in the
+// background, blocks until either one fails to bind/serve or stop fires,
+// and on stop performs a graceful shutdown of both. stop is the signal
+// source (SIGTERM/SIGINT in production, an arbitrary channel in tests).
+//
+// Graceful shutdown here means exactly what http.Server.Shutdown documents
+// and no more: it stops accepting new connections, then waits (up to
+// shutdownTimeout) for idle connections to close and in-flight, NON-hijacked
+// requests to finish. It explicitly does NOT track or wait for hijacked
+// connections — this proxy's WebSocket upgrades and any still-streaming SSE
+// response are hijacked or long-lived and are NOT drained here: they keep
+// running, using the listener that just stopped accepting new connections,
+// until they finish on their own or the process is killed outright after
+// this function returns. This bounds the blast radius of a rolling update
+// to "new requests are refused promptly and ordinary requests finish
+// cleanly," not "every open session drains gracefully."
+func serveAndAwaitShutdown(metricsLn, proxyLn net.Listener, metricsServer, proxyServer *http.Server, stop <-chan struct{}, shutdownTimeout time.Duration) error {
+	// Both servers run in the background against listeners the caller
+	// already bound (production binds cfg.MetricsAddr/ListenAddr directly;
+	// tests bind ephemeral loopback ports so they can talk to a real
+	// server). A Serve failure on either is reported on serveErrCh so it
+	// aborts instead of running half-wired forever.
+	serveErrCh := make(chan error, 2)
+	go func() {
+		if err := metricsServer.Serve(metricsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErrCh <- fmt.Errorf("metrics server: %w", err)
+		}
+	}()
+	go func() {
+		if err := proxyServer.Serve(proxyLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErrCh <- fmt.Errorf("proxy server: %w", err)
+		}
+	}()
+
+	select {
+	case err := <-serveErrCh:
+		return err
+	case <-stop:
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+	_ = proxyServer.Shutdown(shutdownCtx)
+	_ = metricsServer.Shutdown(shutdownCtx)
+	return nil
 }
 
 func main() {

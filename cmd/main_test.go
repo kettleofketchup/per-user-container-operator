@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -117,5 +119,117 @@ func TestParseRouterFlagsRequiresAppAndNamespace(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("missing --app/--namespace must error")
+	}
+}
+
+// TestServeAndAwaitShutdownDrainsInFlightNonHijackedRequest is Finding 2's
+// fix: on a stop signal, serveAndAwaitShutdown must let an in-flight,
+// ordinary (non-hijacked) request finish rather than killing it outright,
+// and must not return until that drain (bounded by shutdownTimeout)
+// completes.
+func TestServeAndAwaitShutdownDrainsInFlightNonHijackedRequest(t *testing.T) {
+	metricsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen metrics: %v", err)
+	}
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	proxyServer := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(handlerStarted)
+		<-releaseHandler
+		w.WriteHeader(http.StatusOK)
+	})}
+	metricsServer := &http.Server{Handler: http.NewServeMux()}
+
+	stop := make(chan struct{})
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- serveAndAwaitShutdown(metricsLn, proxyLn, metricsServer, proxyServer, stop, 5*time.Second)
+	}()
+
+	// Issue a request and wait for the handler to actually start before
+	// triggering shutdown, so the request is genuinely in-flight.
+	reqDone := make(chan int, 1)
+	go func() {
+		resp, err := http.Get("http://" + proxyLn.Addr().String() + "/")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		reqDone <- resp.StatusCode
+	}()
+	select {
+	case <-handlerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler never started")
+	}
+
+	close(stop)
+
+	// serveAndAwaitShutdown must NOT return while the in-flight request is
+	// still being held open by the handler.
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("serveAndAwaitShutdown returned (err=%v) before the in-flight request finished -- it must drain non-hijacked requests, not kill them", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(releaseHandler)
+
+	select {
+	case status := <-reqDone:
+		if status != http.StatusOK {
+			t.Fatalf("in-flight request status = %d, want 200 (it must complete successfully during shutdown)", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight request never completed")
+	}
+
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("serveAndAwaitShutdown returned error %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveAndAwaitShutdown never returned after the in-flight request finished")
+	}
+}
+
+// TestServeAndAwaitShutdownReturnsPromptlyWithNoInFlightRequests is the
+// companion case: with no in-flight work, shutdown must complete almost
+// immediately rather than blocking for the full shutdownTimeout.
+func TestServeAndAwaitShutdownReturnsPromptlyWithNoInFlightRequests(t *testing.T) {
+	metricsLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen metrics: %v", err)
+	}
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	metricsServer := &http.Server{Handler: http.NewServeMux()}
+	proxyServer := &http.Server{Handler: http.NewServeMux()}
+
+	stop := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- serveAndAwaitShutdown(metricsLn, proxyLn, metricsServer, proxyServer, stop, 30*time.Second)
+	}()
+
+	close(stop)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveAndAwaitShutdown took far longer than necessary to shut down with no in-flight work")
 	}
 }
