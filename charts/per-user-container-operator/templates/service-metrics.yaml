@@ -1,0 +1,28 @@
+{{- if .Values.metrics.enabled }}
+{{/*
+The controller's own metrics Service. Router Services are created at
+RUNTIME by the controller (Task 11) and so are not rendered here -- this is
+the ONE Service this chart renders. port/targetPort/the container's
+"metrics" port/--metrics-addr all resolve from .Values.metrics.port so they
+cannot drift onto different numbers.
+
+Carries LabelPartOf + LabelComponent=controller (Task 4's constants) so the
+controller ServiceMonitor below can select exactly this Service and no
+other: selecting on LabelPartOf alone would also match every router
+Service in every watched namespace, double-scraping the router.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "puc.name" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "puc.controllerPodLabels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "puc.controllerPodLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+{{- end }}

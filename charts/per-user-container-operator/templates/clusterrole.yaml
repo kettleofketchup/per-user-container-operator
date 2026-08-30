@@ -1,0 +1,36 @@
+{{/*
+The ONE ClusterRole this chart renders, covering exactly three things: the
+two CustomResourceDefinition objects (apiextensions.k8s.io is cluster-scoped
+even though PerUserApp/Workspace themselves are namespaced -- the CRs
+themselves are granted by the per-namespace Role in role.yaml), leader
+election Leases, and storageclasses.
+
+storage.k8s.io/storageclasses is NOT in the spec's RBAC list (spec 556 says
+"Nothing else is cluster-scoped") -- that line is a SPEC DEFECT, recorded
+here rather than satisfied: ValidateStorageClass (Task 11) needs `get` on
+StorageClass to refuse a Delete reclaimPolicy, and StorageClass is
+cluster-scoped. Task 11's review proved on a real authorizer that a
+NAMESPACED Role granting this answers a namespaced
+SelfSubjectAccessReview Allowed:true while the real (never namespaced)
+client.Get() is Forbidden -- the startup probe would report the namespace
+ready while every reconcile 403s and ConfigValid goes False fleet-wide. So
+this grant lives ONLY here, on the ClusterRole -- never added to the
+per-namespace Role in role.yaml, which is the natural-looking move that
+fails exactly this way.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "puc.name" . }}
+  labels:
+    {{- include "puc.controllerPodLabels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]

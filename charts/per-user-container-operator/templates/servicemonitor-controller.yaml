@@ -1,0 +1,22 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+{{/*
+Selects ONLY the controller metrics Service (service-metrics.yaml), by the
+exact two-label pair {LabelPartOf, LabelComponent=controller}. No
+namespaceSelector is needed: the Service lives in .Release.Namespace, which
+is a ServiceMonitor's own default scope.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "puc.name" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "puc.monitoringLabels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "puc.controllerPodLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+{{- end }}

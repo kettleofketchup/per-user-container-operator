@@ -1,0 +1,67 @@
+{{/*
+The controller Deployment, carrying Task 11's startup contract
+(cmd/controller.go's parseControllerFlags) in full:
+
+  - --watch-namespaces from the SAME .Values.watchNamespaces list that
+    renders every Role/RoleBinding above and both ServiceMonitors below --
+    a mismatch leaves the manager's cache cluster-scoped against
+    namespace-scoped Roles and the controller CrashLoops on every install.
+  - --pod-cidr / --node-cidr from .Values.clusterPodCIDR / .Values.nodeCIDR
+    -- required by the workspace and router NetworkPolicy render functions.
+  - --metrics-addr, the container's "metrics" port, and the metrics
+    Service's port/targetPort (service.yaml) all resolve from the SAME
+    .Values.metrics.port value, never the bare v1alpha1.MetricsPort
+    constant, so an operator who overrides the port does not end up with a
+    Service targeting a port nothing listens on.
+  - RELATED_IMAGE_ROUTER set to the SAME image reference this container
+    runs: the controller creates the router Deployment at runtime from one
+    image selected by subcommand, and this env var is also the airgap
+    extractor's harvest point (it matches the RELATED_IMAGE_ prefix) --
+    an unset value is not a startup nicety, it is a router Deployment that
+    never becomes ready AND an image missing from the airgap bundle.
+  - POD_NAME / POD_NAMESPACE from the downward API, required by
+    parseControllerFlags and by the leader-election Lease snapshot taken
+    before mgr.Start().
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "puc.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "puc.controllerPodLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "puc.controllerPodLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "puc.controllerPodLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "puc.name" . }}
+      containers:
+        - name: controller
+          image: {{ include "puc.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - controller
+            - --watch-namespaces={{ join "," .Values.watchNamespaces }}
+            - --pod-cidr={{ .Values.clusterPodCIDR }}
+            - --node-cidr={{ .Values.nodeCIDR }}
+            - --metrics-addr=:{{ .Values.metrics.port }}
+          env:
+            - name: RELATED_IMAGE_ROUTER
+              value: {{ include "puc.image" . }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
