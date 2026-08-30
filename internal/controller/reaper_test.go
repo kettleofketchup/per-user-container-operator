@@ -114,40 +114,84 @@ func TestIdleTimeoutDecidesReapAgainstASyntheticClock(t *testing.T) {
 // own last heartbeat, at which point the dead replica no longer pins the
 // workspace.
 func TestLiveConnectionOnAnotherReplicaPreventsReap(t *testing.T) {
-	metrics.ResetForTest()
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	app := appWithLimits("ns-conn", 5)
-	heartbeat := app.Spec.Lifecycle.ConnectionHeartbeatInterval.Duration
+	t.Run("dead replica's stale entry ages out", func(t *testing.T) {
+		metrics.ResetForTest()
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		app := appWithLimits("ns-conn", 5)
+		heartbeat := app.Spec.Lifecycle.ConnectionHeartbeatInterval.Duration
 
-	ws := readyWorkspace(app, "alice")
-	ws.Status.LastActivity = ptrTime(now.Add(-2 * app.Spec.Lifecycle.IdleTimeout.Duration))
-	ws.Status.Connections = map[string]v1alpha1.ConnectionEntry{
-		"router-replica-a": {Count: 1, HeartbeatAt: metav1.NewTime(now.Add(-(2*heartbeat + 10*time.Second)))},
-		"router-replica-b": {Count: 1, HeartbeatAt: metav1.NewTime(now)},
-	}
+		ws := readyWorkspace(app, "alice")
+		ws.Status.LastActivity = ptrTime(now.Add(-2 * app.Spec.Lifecycle.IdleTimeout.Duration))
+		ws.Status.Connections = map[string]v1alpha1.ConnectionEntry{
+			"router-replica-a": {Count: 1, HeartbeatAt: metav1.NewTime(now.Add(-(2*heartbeat + 10*time.Second)))},
+			"router-replica-b": {Count: 1, HeartbeatAt: metav1.NewTime(now)},
+		}
 
-	c := newFakeClient(t, app, ws)
-	clock := now
-	r := &Reaper{Client: c, Clock: func() time.Time { return clock }}
+		c := newFakeClient(t, app, ws)
+		clock := now
+		r := &Reaper{Client: c, Clock: func() time.Time { return clock }}
 
-	if err := r.Reap(context.Background()); err != nil {
-		t.Fatalf("Reap while B is fresh: %v", err)
-	}
-	var stillLive v1alpha1.Workspace
-	mustGetInto(t, c, ws, &stillLive)
-	if stillLive.Status.ScaledDown {
-		t.Fatalf("a live connection on another replica (B) must prevent reap even though A already looks dead")
-	}
+		if err := r.Reap(context.Background()); err != nil {
+			t.Fatalf("Reap while B is fresh: %v", err)
+		}
+		var stillLive v1alpha1.Workspace
+		mustGetInto(t, c, ws, &stillLive)
+		if stillLive.Status.ScaledDown {
+			t.Fatalf("a live connection on another replica (B) must prevent reap even though A already looks dead")
+		}
 
-	clock = now.Add(2*heartbeat + time.Second)
-	if err := r.Reap(context.Background()); err != nil {
-		t.Fatalf("Reap once B is stale: %v", err)
-	}
-	var nowReaped v1alpha1.Workspace
-	mustGetInto(t, c, ws, &nowReaped)
-	if !nowReaped.Status.ScaledDown {
-		t.Fatalf("once B's heartbeat is stale past 2x connectionHeartbeatInterval, the dead replica must not pin the workspace forever")
-	}
+		clock = now.Add(2*heartbeat + time.Second)
+		if err := r.Reap(context.Background()); err != nil {
+			t.Fatalf("Reap once B is stale: %v", err)
+		}
+		var nowReaped v1alpha1.Workspace
+		mustGetInto(t, c, ws, &nowReaped)
+		if !nowReaped.Status.ScaledDown {
+			t.Fatalf("once B's heartbeat is stale past 2x connectionHeartbeatInterval, the dead replica must not pin the workspace forever")
+		}
+	})
+
+	// A fresh entry alone is not liveness: a replica that is alive,
+	// heartbeating on schedule, and correctly reporting zero connections for
+	// this user must not itself block reaping. Only the SUM of Count across
+	// fresh entries decides -- this is exactly the case that shipped green
+	// under a presence-only (freshness-only) predicate: see task-9-report.md
+	// Fix Report for the fail-then-pass observation this case produced.
+	t.Run("fresh entry with Count 0 does not block reap; fresh entry with Count>0 does", func(t *testing.T) {
+		metrics.ResetForTest()
+		now := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+		app := appWithLimits("ns-conn-zero", 5)
+
+		zeroWS := readyWorkspace(app, "dave")
+		zeroWS.Status.LastActivity = ptrTime(now.Add(-2 * app.Spec.Lifecycle.IdleTimeout.Duration))
+		zeroWS.Status.Connections = map[string]v1alpha1.ConnectionEntry{
+			"router-replica-c": {Count: 0, HeartbeatAt: metav1.NewTime(now)},
+		}
+
+		liveWS := readyWorkspace(app, "erin")
+		liveWS.Status.LastActivity = ptrTime(now.Add(-2 * app.Spec.Lifecycle.IdleTimeout.Duration))
+		liveWS.Status.Connections = map[string]v1alpha1.ConnectionEntry{
+			"router-replica-d": {Count: 1, HeartbeatAt: metav1.NewTime(now)},
+		}
+
+		c := newFakeClient(t, app, zeroWS, liveWS)
+		r := &Reaper{Client: c, Clock: func() time.Time { return now }}
+		if err := r.Reap(context.Background()); err != nil {
+			t.Fatalf("Reap: %v", err)
+		}
+
+		var gotZero v1alpha1.Workspace
+		mustGetInto(t, c, zeroWS, &gotZero)
+		if !gotZero.Status.ScaledDown {
+			t.Fatalf("a fresh connections entry with Count: 0 must NOT block reap -- an idle-but-alive replica correctly heartbeating zero connections must not pin the workspace forever")
+		}
+
+		var gotLive v1alpha1.Workspace
+		mustGetInto(t, c, liveWS, &gotLive)
+		if gotLive.Status.ScaledDown {
+			t.Fatalf("a fresh connections entry with Count > 0 must still block reap")
+		}
+	})
 }
 
 // TestIdleOnlyAfterPodGone drives the WorkspaceReconciler (not the Reaper)
@@ -404,5 +448,77 @@ func TestPerAppReapIntervalGatesEachPass(t *testing.T) {
 	}
 	if wsListCalls != 5 {
 		t.Fatalf("third pass: both apps due again (100s elapsed for the slow app), want 5 total Workspace Lists, got %d", wsListCalls)
+	}
+}
+
+func gatherReaperCompletion(t *testing.T, ns, app string) (float64, bool) {
+	t.Helper()
+	mfs, err := metrics.Gatherer().Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "puc_reaper_last_completion_timestamp_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["namespace"] == ns && labels["app"] == app {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
+// TestFailedPassDoesNotAdvanceLastPassOrCompletionGauge guards Finding 2: a
+// genuine per-app failure (a transient Workspace List error here, distinct
+// from a Conflict -- which reapApp already treats as success) must neither
+// advance r.lastPass nor set puc_reaper_last_completion_timestamp_seconds.
+// Doing either would defer the next real attempt by a full reapInterval
+// while the gauge exists specifically to catch reads exactly this kind of
+// silent failure.
+func TestFailedPassDoesNotAdvanceLastPassOrCompletionGauge(t *testing.T) {
+	metrics.ResetForTest()
+	app := appWithLimits("ns-transient-fail", 5)
+	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	base := newFakeClient(t, app)
+	wc, ok := base.(client.WithWatch)
+	if !ok {
+		t.Fatalf("fake client does not implement client.WithWatch")
+	}
+	failNext := true
+	c := interceptor.NewClient(wc, interceptor.Funcs{
+		List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*v1alpha1.WorkspaceList); ok && failNext {
+				failNext = false
+				return fmt.Errorf("injected transient failure")
+			}
+			return cl.List(ctx, list, opts...)
+		},
+	})
+
+	r := &Reaper{Client: c, Clock: func() time.Time { return now }}
+
+	if err := r.Reap(context.Background()); err == nil {
+		t.Fatalf("want the injected List error to surface from the first Reap call")
+	}
+	if _, found := gatherReaperCompletion(t, app.Namespace, app.Name); found {
+		t.Fatalf("completion gauge must NOT be set after a failed pass")
+	}
+
+	// No clock advance: if the failed pass had wrongly recorded lastPass,
+	// this app would now be gated out for a full reapInterval and the
+	// second call would be a no-op rather than a genuine retry.
+	if err := r.Reap(context.Background()); err != nil {
+		t.Fatalf("second Reap (List now succeeds): %v", err)
+	}
+	v, found := gatherReaperCompletion(t, app.Namespace, app.Name)
+	if !found || v != float64(now.Unix()) {
+		t.Fatalf("completion gauge after a successful retry = %v (found=%v), want exactly %v", v, found, float64(now.Unix()))
 	}
 }

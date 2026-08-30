@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
@@ -39,15 +40,24 @@ const reaperTickInterval = 10 * time.Second
 //   - status.phase == Ready
 //   - status.scaledDown == false
 //   - now - status.lastActivity > app.spec.lifecycle.idleTimeout
-//   - no status.connections entry has heartbeatAt fresher than
-//     2 x lifecycle.connectionHeartbeatInterval
+//   - the SUM of entry.Count over every status.connections entry whose
+//     heartbeatAt is fresher than 2 x lifecycle.connectionHeartbeatInterval
+//     is exactly 0
 //
-// status.connections is keyed by router replica pod name and self-expiring:
-// each entry is live only while its own heartbeatAt is fresh. A dead
-// replica's entry simply ages out -- it never needs to be zeroed by another
-// replica, which is what makes the per-replica keying safe where a single
-// absolute counter would not be (see WorkspaceStatus.Connections' doc
-// comment).
+// status.connections is keyed by router replica pod name; each entry's
+// heartbeatAt self-expires it after 2x the heartbeat interval, which is what
+// lets a dead replica's stale entry age out instead of pinning a workspace
+// forever. But "self-expiring" only bounds staleness -- it says nothing
+// about a replica that is alive, heartbeating on schedule, and correctly
+// reporting zero connections for this user (Count: 0). Only summing Count
+// across fresh entries -- not merely checking whether any fresh entry
+// exists -- distinguishes that from an actual live connection; a
+// presence-only check would let a single always-on, always-idle replica
+// block reaping permanently, which is a silent, permanent resource leak
+// with no consumer of ConnectionEntry.Count anywhere else to catch it.
+// Task 10's router must publish exactly this predicate: Count as its
+// current live connection count for this user, HeartbeatAt refreshed on the
+// same schedule regardless of whether Count is currently 0.
 type Reaper struct {
 	Client client.Client
 
@@ -132,6 +142,15 @@ func (r *Reaper) Start(ctx context.Context) error {
 // evaluated it (tracked in-memory in r.lastPass; an app never seen before is
 // always due). Reap is exported so both Start's ticking loop and tests can
 // drive a pass directly against a synthetic clock.
+//
+// r.lastPass and puc_reaper_last_completion_timestamp_seconds are advanced
+// for an app ONLY when reapApp genuinely succeeds for it. A Conflict from a
+// wake race is already treated as success inside reapApp (the write was
+// correctly refused, not failed) and never reaches here as an error; a real
+// failure (e.g. a transient List error) must neither advance lastPass -- or
+// the next real attempt is deferred by a full reapInterval -- nor set the
+// completion gauge, which exists specifically to surface a reaper that is
+// silently failing while still looking healthy.
 func (r *Reaper) Reap(ctx context.Context) error {
 	now := r.now()
 
@@ -152,8 +171,13 @@ func (r *Reaper) Reap(ctx context.Context) error {
 			continue
 		}
 
-		if err := r.reapApp(ctx, app, now); err != nil && firstErr == nil {
-			firstErr = err
+		if err := r.reapApp(ctx, app, now); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			logf.FromContext(ctx).Error(err, "reap pass failed; not advancing lastPass so the next tick retries immediately rather than waiting a full reapInterval",
+				"namespace", app.Namespace, "app", app.Name)
+			continue
 		}
 		r.lastPass[key] = now
 		metrics.SetReaperLastCompletion(app.Namespace, app.Name, float64(now.Unix()))
@@ -208,24 +232,29 @@ func isReapable(ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp, now time.Time)
 	if now.Sub(ws.Status.LastActivity.Time) <= app.Spec.Lifecycle.IdleTimeout.Duration {
 		return false
 	}
-	return !hasLiveConnection(ws, app, now)
+	return freshConnectionCount(ws, app, now) == 0
 }
 
-// hasLiveConnection reports whether any status.connections entry (keyed by
-// router replica pod name) has a heartbeatAt fresher than
+// freshConnectionCount sums entry.Count over every status.connections entry
+// (keyed by router replica pod name) whose heartbeatAt is fresher than
 // 2 x lifecycle.connectionHeartbeatInterval. Both the router (Task 10) and
-// this predicate use exactly this freshness threshold and nothing else --
-// see WorkspaceStatus.Connections' doc comment for why a dead replica's
+// this predicate use exactly this freshness threshold and nothing else. The
+// sum, not mere presence of a fresh entry, is what decides liveness: a
+// replica that is alive and heartbeating on schedule but correctly reports
+// Count: 0 for this user must not itself block reaping -- see the Reaper
+// doc comment for why a presence-only check is a permanent-leak footgun,
+// and WorkspaceStatus.Connections' doc comment for why a dead replica's
 // stale entry must never pin a workspace forever, and why a live replica's
 // fresh entry must never be masked by another replica's absence.
-func hasLiveConnection(ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp, now time.Time) bool {
+func freshConnectionCount(ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp, now time.Time) int32 {
 	threshold := 2 * app.Spec.Lifecycle.ConnectionHeartbeatInterval.Duration
+	var total int32
 	for _, entry := range ws.Status.Connections {
 		if now.Sub(entry.HeartbeatAt.Time) < threshold {
-			return true
+			total += entry.Count
 		}
 	}
-	return false
+	return total
 }
 
 // ScaleDown performs the Reaper's one and only write: a conditional
