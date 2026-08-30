@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -16,6 +17,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
+)
+
+// Default bounds for the watch-reconnect backoff in WatchServiceDeletes /
+// WatchWorkspaceDeletes. 200ms is short enough that a routine
+// --min-request-timeout close (the common case) reconnects almost
+// immediately; 30s caps how hard a persistently broken connection (e.g. a
+// control-plane outage) is hammered.
+const (
+	defaultReconnectMinBackoff = 200 * time.Millisecond
+	defaultReconnectMaxBackoff = 30 * time.Second
 )
 
 // Resolver addresses a workspace's Service by NAME, never by a memoised
@@ -31,8 +42,29 @@ import (
 type Resolver struct {
 	Client client.Client
 
+	// ReconnectMinBackoff/ReconnectMaxBackoff bound the delay between watch
+	// reconnect attempts in WatchServiceDeletes/WatchWorkspaceDeletes,
+	// defaulting to defaultReconnectMinBackoff/MaxBackoff when zero. Tests
+	// shorten these instead of waiting on production-scale backoff.
+	ReconnectMinBackoff time.Duration
+	ReconnectMaxBackoff time.Duration
+
 	mu    sync.RWMutex
 	cache map[client.ObjectKey]string
+}
+
+func (r *Resolver) reconnectMinBackoff() time.Duration {
+	if r.ReconnectMinBackoff > 0 {
+		return r.ReconnectMinBackoff
+	}
+	return defaultReconnectMinBackoff
+}
+
+func (r *Resolver) reconnectMaxBackoff() time.Duration {
+	if r.ReconnectMaxBackoff > 0 {
+		return r.ReconnectMaxBackoff
+	}
+	return defaultReconnectMaxBackoff
 }
 
 // NewResolver returns a Resolver backed by c.
@@ -131,37 +163,116 @@ func (r *Resolver) HandleWorkspaceEvent(evt watch.Event) {
 	r.Invalidate(obj.GetNamespace(), obj.GetName())
 }
 
-// watchDeletes runs until ctx is done or the watch closes, calling onDelete
-// for every Deleted event observed. It is the shared plumbing behind
-// WatchServiceDeletes and WatchWorkspaceDeletes.
-func watchDeletes(ctx context.Context, wc client.WithWatch, list client.ObjectList, opts []client.ListOption, onDelete func(evt watch.Event)) error {
-	w, err := wc.Watch(ctx, list, opts...)
-	if err != nil {
-		return err
+// watchDeletes runs until ctx is done, calling onDelete for every Deleted
+// event observed, and RECONNECTS — with capped exponential backoff — every
+// time the watch's channel closes or the initial Watch call itself errors.
+//
+// Kubernetes closes watches routinely: --min-request-timeout expiry, a 410
+// resourceVersion-too-old, any network blip. A raw client.WithWatch, unlike
+// controller-runtime's own informer/reflector machinery, does not recover
+// from any of those on its own — a single-shot "watch once, return when the
+// channel closes" implementation goes silently and permanently idle the
+// first time any of them happens, with no error surfaced anywhere. From
+// that moment, Resolver.Invalidate is never called again for the remaining
+// life of the process: cache invalidation is dead, a stale cached address
+// persists, and that is exactly the recycled-ClusterIP path this package's
+// doc comment describes — one user's request landing in whoever's pod that
+// address was later reassigned to. Exiting only on ctx cancellation is the
+// fix; newList is called fresh on every (re)connect attempt since a
+// client.ObjectList used for one Watch call must not be reused for another.
+func watchDeletes(ctx context.Context, wc client.WithWatch, newList func() client.ObjectList, opts []client.ListOption, onDelete func(evt watch.Event), minBackoff, maxBackoff time.Duration) {
+	backoff := minBackoff
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		w, err := wc.Watch(ctx, newList(), opts...)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if !sleepOrDone(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff, maxBackoff)
+			continue
+		}
+
+		drainUntilClosedOrDone(ctx, w, onDelete)
+		w.Stop()
+		if ctx.Err() != nil {
+			return
+		}
+
+		// The channel closed (a routine server-side timeout, the common
+		// case) or a transient recv error occurred; back off before
+		// reconnecting so a persistently broken connection does not spin.
+		if !sleepOrDone(ctx, backoff) {
+			return
+		}
+		backoff = nextBackoff(backoff, maxBackoff)
 	}
-	defer w.Stop()
+}
+
+// drainUntilClosedOrDone forwards every event on w's ResultChan to onDelete
+// until ctx is done or the channel closes.
+func drainUntilClosedOrDone(ctx context.Context, w watch.Interface, onDelete func(evt watch.Event)) {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		case evt, ok := <-w.ResultChan():
 			if !ok {
-				return nil
+				return
 			}
 			onDelete(evt)
 		}
 	}
 }
 
+// sleepOrDone waits for d, returning false immediately (without waiting) if
+// ctx is done first.
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func nextBackoff(d, maxD time.Duration) time.Duration {
+	d *= 2
+	if d > maxD {
+		return maxD
+	}
+	return d
+}
+
 // WatchServiceDeletes watches Service deletions in namespace and invalidates
-// the resolver's cache for each one. It blocks until ctx is cancelled or the
-// watch ends, and is meant to be run in its own goroutine by cmd/main.go.
+// the resolver's cache for each one, reconnecting on any disconnect. It
+// blocks until ctx is cancelled, and is meant to be run in its own goroutine
+// by cmd/main.go. The error return is always nil once ctx is cancelled; it
+// exists so callers can use the same fire-the-goroutine-and-discard-the-
+// return pattern as before without a signature change.
 func (r *Resolver) WatchServiceDeletes(ctx context.Context, wc client.WithWatch, namespace string) error {
-	return watchDeletes(ctx, wc, &corev1.ServiceList{}, []client.ListOption{client.InNamespace(namespace)}, r.HandleServiceEvent)
+	watchDeletes(ctx, wc,
+		func() client.ObjectList { return &corev1.ServiceList{} },
+		[]client.ListOption{client.InNamespace(namespace)},
+		r.HandleServiceEvent, r.reconnectMinBackoff(), r.reconnectMaxBackoff())
+	return nil
 }
 
 // WatchWorkspaceDeletes watches Workspace deletions in namespace and
-// invalidates the resolver's cache for each one (see HandleWorkspaceEvent).
+// invalidates the resolver's cache for each one (see HandleWorkspaceEvent),
+// reconnecting on any disconnect exactly like WatchServiceDeletes.
 func (r *Resolver) WatchWorkspaceDeletes(ctx context.Context, wc client.WithWatch, namespace string) error {
-	return watchDeletes(ctx, wc, &v1alpha1.WorkspaceList{}, []client.ListOption{client.InNamespace(namespace)}, r.HandleWorkspaceEvent)
+	watchDeletes(ctx, wc,
+		func() client.ObjectList { return &v1alpha1.WorkspaceList{} },
+		[]client.ListOption{client.InNamespace(namespace)},
+		r.HandleWorkspaceEvent, r.reconnectMinBackoff(), r.reconnectMaxBackoff())
+	return nil
 }

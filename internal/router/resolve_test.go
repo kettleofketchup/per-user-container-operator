@@ -6,10 +6,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"k8s.io/apimachinery/pkg/watch"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/kettleofketchup/per-user-container-operator/internal/identity"
 )
@@ -128,4 +132,109 @@ func TestResolveCachesUntilInvalidated(t *testing.T) {
 	if _, err := r.Resolve(context.Background(), ns, "svc-a", 8000); err == nil {
 		t.Fatalf("resolve after invalidation must re-Get and fail (the Service no longer exists)")
 	}
+}
+
+// watchCapture records every watch.Interface a wrapped client.WithWatch
+// hands out, via an interceptor, so a test can reach in and Stop() one from
+// outside the goroutine that's consuming it.
+type watchCapture struct {
+	mu      sync.Mutex
+	watches []watch.Interface
+}
+
+func (c *watchCapture) record(w watch.Interface) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.watches = append(c.watches, w)
+}
+
+func (c *watchCapture) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.watches)
+}
+
+func (c *watchCapture) at(i int) watch.Interface {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.watches[i]
+}
+
+func newCapturingWatchClient(t *testing.T, base client.WithWatch) (client.WithWatch, *watchCapture) {
+	t.Helper()
+	capture := &watchCapture{}
+	wrapped := interceptor.NewClient(base, interceptor.Funcs{
+		Watch: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) (watch.Interface, error) {
+			w, err := c.Watch(ctx, list, opts...)
+			if err == nil {
+				capture.record(w)
+			}
+			return w, err
+		},
+	})
+	return wrapped, capture
+}
+
+// TestWatchServiceDeletesReconnectsAfterChannelCloses is the fix for the
+// CRITICAL finding on this task: Kubernetes closes watches routinely
+// (--min-request-timeout expiry, a 410 resourceVersion-too-old, any network
+// blip). A fire-and-forget watchDeletes that returns the moment its
+// ResultChan closes stops invalidating the resolver's cache for the
+// remaining life of the process — silently, with no error surfaced anywhere
+// — which is exactly the recycled-ClusterIP path TestRecycledClusterIPDoesNotCrossUsers
+// guards against, except here nothing ever calls Invalidate a second time to
+// catch it.
+//
+// This test closes the FIRST watch's channel out from under
+// WatchServiceDeletes (simulating the server-initiated close above), then
+// deletes the Service for real and waits for that delete to still land: the
+// resolver's cache must eventually invalidate, meaning the watch loop must
+// have reconnected and be listening again, not have exited.
+func TestWatchServiceDeletesReconnectsAfterChannelCloses(t *testing.T) {
+	ns := "ns-reconnect"
+	svc := serviceFor(ns, "svc-a", "10.0.0.5", 8000)
+	fc := newFakeClient(t, svc)
+	wrapped, watches := newCapturingWatchClient(t, fc)
+
+	r := NewResolver(fc)
+	r.ReconnectMinBackoff = 10 * time.Millisecond
+	r.ReconnectMaxBackoff = 50 * time.Millisecond
+
+	if _, err := r.Resolve(context.Background(), ns, "svc-a", 8000); err != nil {
+		t.Fatalf("prime cache: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.WatchServiceDeletes(ctx, wrapped, ns) }()
+
+	waitUntil(t, 2*time.Second, func() bool { return watches.count() >= 1 })
+
+	// Simulate the API server closing the watch out from under the router.
+	// A fake client's watch.Interface.Stop() closes its ResultChan exactly
+	// like a real server-initiated close does from the consumer's side.
+	watches.at(0).Stop()
+
+	// A correct implementation reconnects (with backoff) after the channel
+	// closes. That reconnect must be observed BEFORE the delete below: a
+	// NEW watch only sees events that occur after it starts, so delivering
+	// the delete first would prove nothing either way.
+	waitUntil(t, 2*time.Second, func() bool { return watches.count() >= 2 })
+
+	// The Service is deleted for real AFTER the reconnect. If the watch
+	// loop never reconnected (the fire-and-forget bug), nothing is
+	// listening when this happens and the resolver's cache never
+	// invalidates.
+	if err := fc.Delete(context.Background(), svc); err != nil {
+		t.Fatalf("delete service: %v", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := r.Resolve(context.Background(), ns, "svc-a", 8000); err != nil {
+			return // invalidated, and the re-Get correctly failed: reconnect worked.
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("cache was never invalidated after the watch reconnected and observed the delete -- the watch loop must reconnect on channel close, not exit (fire-and-forget bug)")
 }
