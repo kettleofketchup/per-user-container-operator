@@ -1,0 +1,28 @@
+# Superpowers working artifacts (specs, plans, ledgers) — local only.
+docs/superpowers/
+.superpowers/
+
+# Go
+bin/
+dist/
+vendor/
+*.test
+*.out
+cover.html
+
+# Build / tooling
+.env
+.envrc
+.direnv/
+result
+result-*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Kubernetes local scratch
+kubeconfig
+*.kubeconfig
