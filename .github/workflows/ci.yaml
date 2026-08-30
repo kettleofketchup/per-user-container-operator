@@ -19,3 +19,27 @@ jobs:
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
       - run: make lint test
+
+  # test/envtest (//go:build envtest) is NOT covered by lint-test above --
+  # that job runs untagged `go test ./...`, which never compiles or runs
+  # this suite. Kept as its own job, not a step tacked onto lint-test,
+  # because it spins up a real kube-apiserver/etcd per package and is
+  # slower than the untagged suite; a failure here should not be conflated
+  # with (or gate the turnaround of) fast lint/unit feedback.
+  #
+  # Requires helm on PATH: test/envtest/chart_helper_test.go renders
+  # charts/per-user-container-operator with `helm template` to obtain the
+  # router Role TestRouterRoleGrantsExactlyWhatTheRouterDoes applies against
+  # a real impersonated client.
+  envtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.15.4
+      - name: Run envtest suite
+        run: make envtest-run
