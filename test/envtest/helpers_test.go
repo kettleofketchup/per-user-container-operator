@@ -128,6 +128,26 @@ func impersonatedClient(t *testing.T, ns, saName string) client.Client {
 	return c
 }
 
+// impersonatedWatchClient is impersonatedClient's client.WithWatch variant:
+// the router's Resolver calls client.WithWatch.Watch directly (never List)
+// to invalidate its address cache, so only a WithWatch client against the
+// real envtest RBAC authorizer can prove the router's Role actually grants
+// the `watch` verb on services -- a plain client.Client has no Watch method
+// to even attempt the call the router itself makes.
+func impersonatedWatchClient(t *testing.T, ns, saName string) client.WithWatch {
+	t.Helper()
+	impCfg := rest.CopyConfig(cfg)
+	impCfg.Impersonate = rest.ImpersonationConfig{
+		UserName: fmt.Sprintf("system:serviceaccount:%s:%s", ns, saName),
+		Groups:   []string{"system:serviceaccounts", fmt.Sprintf("system:serviceaccounts:%s", ns), "system:authenticated"},
+	}
+	c, err := client.NewWithWatch(impCfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatalf("impersonated watch client: %v", err)
+	}
+	return c
+}
+
 // gatherMetric searches the shared metrics registry for a sample of family
 // name whose labels are a superset of want, returning its value. Namespaces
 // are unique per test (newNamespace), so distinct tests never share a label

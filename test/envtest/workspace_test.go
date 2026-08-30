@@ -575,12 +575,21 @@ func TestRouterRoleGrantsExactlyWhatTheRouterDoes(t *testing.T) {
 	// the chart-rendered one; until then this test can only assert the
 	// fixture's own rules, not the rules that ship. See
 	// task-6-brief.md's note on why that is deliberate.
+	//
+	// services carries "watch" alongside get/list: the router's Resolver
+	// (internal/router/resolve.go) calls client.WithWatch.Watch on Services
+	// to invalidate its address cache on delete, not merely List. A Role
+	// granting only get/list 403s that watch, cache invalidation never
+	// fires, addresses go stale, and a recycled ClusterIP routes one user's
+	// request into another user's container -- a real bug this fixture
+	// shipped with (Task 10) and the watch assertions below exist
+	// specifically to keep it from regressing silently.
 	role := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.RouterRoleName, Namespace: ns},
 		Rules: []rbacv1.PolicyRule{
 			{APIGroups: []string{v1alpha1.GroupVersion.Group}, Resources: []string{"workspaces"}, Verbs: []string{"get", "list", "watch", "create"}},
 			{APIGroups: []string{v1alpha1.GroupVersion.Group}, Resources: []string{"workspaces/status"}, Verbs: []string{"get", "patch"}},
-			{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "list"}},
+			{APIGroups: []string{""}, Resources: []string{"services"}, Verbs: []string{"get", "list", "watch"}},
 			{APIGroups: []string{"discovery.k8s.io"}, Resources: []string{"endpointslices"}, Verbs: []string{"list"}},
 		},
 	}
@@ -626,7 +635,20 @@ func TestRouterRoleGrantsExactlyWhatTheRouterDoes(t *testing.T) {
 		t.Fatalf("router role must allow listing endpointslices: %v", err)
 	}
 
-	// The same four operations, unbound: all rejected. Otherwise this test
+	// The router's Resolver calls client.WithWatch.Watch on Services, never
+	// List, to invalidate its address cache -- a Role granting only get/list
+	// 403s this and cache invalidation never fires again for the life of the
+	// process. A plain client.Client (routerClient above) has no Watch
+	// method at all, so this needs its own WithWatch client to even attempt
+	// the call the router itself makes.
+	routerWatchClient := impersonatedWatchClient(t, ns, sa.Name)
+	svcWatch, err := routerWatchClient.Watch(context.Background(), &corev1.ServiceList{}, client.InNamespace(ns))
+	if err != nil {
+		t.Fatalf("router role must allow watching services (Resolver.WatchServiceDeletes depends on this): %v", err)
+	}
+	svcWatch.Stop()
+
+	// The same five operations, unbound: all rejected. Otherwise this test
 	// would pass against a cluster with no RBAC enforcement at all.
 	otherUserKey := identity.UserKey(ns, app.Name, "dave")
 	otherWorkspace := newWorkspace.DeepCopy()
@@ -645,6 +667,10 @@ func TestRouterRoleGrantsExactlyWhatTheRouterDoes(t *testing.T) {
 	}
 	if err := unboundClient.List(context.Background(), &epsList, client.InNamespace(ns)); !apierrors.IsForbidden(err) {
 		t.Fatalf("want Forbidden listing endpointslices as an unbound identity, got %v", err)
+	}
+	unboundWatchClient := impersonatedWatchClient(t, ns, "no-such-router")
+	if _, err := unboundWatchClient.Watch(context.Background(), &corev1.ServiceList{}, client.InNamespace(ns)); !apierrors.IsForbidden(err) {
+		t.Fatalf("want Forbidden watching services as an unbound identity, got %v", err)
 	}
 }
 

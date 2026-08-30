@@ -75,11 +75,19 @@ func TestMain(m *testing.M) {
 	// hardcodes "ceph-block-static" as the storage class name, so it must
 	// exist here for TestStorageGrowthPatchesAndMismatchSetsDrift to
 	// exercise a real growth patch rather than a self-fulfilling mock.
+	//
+	// reclaimPolicy is explicit Retain, matching the production
+	// ceph-block-static class this name refers to (CLAUDE.md): left
+	// unspecified, the API server's own defaulting sets it to Delete, which
+	// would make ValidateStorageClass (Task 11) refuse every fixture app in
+	// this suite.
 	allowExpansion := true
+	retain := corev1.PersistentVolumeReclaimRetain
 	sc := &storagev1.StorageClass{
 		ObjectMeta:           metav1.ObjectMeta{Name: "ceph-block-static"},
 		Provisioner:          "rook-ceph.rbd.csi.ceph.com",
 		AllowVolumeExpansion: &allowExpansion,
+		ReclaimPolicy:        &retain,
 	}
 	if err := k8sClient.Create(context.Background(), sc); err != nil {
 		fmt.Fprintln(os.Stderr, "envtest storageclass:", err)
