@@ -40,6 +40,10 @@ make envtest   # download the envtest binaries for the pinned Kubernetes version
 make e2e       # spin up a kind cluster and run the end-to-end suite
 ```
 
+Until a second package exists in this module, `make build` fails with `build output
+"cmd" already exists and is a directory` — a Go behaviour that occurs when `./...`
+expands to exactly one `main` package; it resolves itself once the next package lands.
+
 ## Runbooks
 
 ### Recovering a Released PV
