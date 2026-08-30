@@ -194,6 +194,18 @@ func SetWorkspaceUserInfo(ns, app, userKey, userDisplay string, present bool) {
 	workspaceUserInfo.WithLabelValues(ns, app, userKey, userDisplay).Set(boolToFloat(present))
 }
 
+// DeleteWorkspaceUserInfo removes the join-metric row for (ns, app, userKey,
+// userDisplay) entirely, rather than leaving it behind at 0. This is the
+// ABSENT path: a workspace/app slug later reused by a different user would
+// otherwise leave the old row at 0 beside the new row at 1, and a Grafana
+// group_left join keyed on (ns, app) would see two right-hand matches — the
+// join errors or resolves ambiguously, and any panel without an explicit
+// ==1 filter lists departed users forever. Call this when a Workspace is
+// deleted; call SetWorkspaceUserInfo(..., true) while it exists.
+func DeleteWorkspaceUserInfo(ns, app, userKey, userDisplay string) {
+	workspaceUserInfo.DeleteLabelValues(ns, app, userKey, userDisplay)
+}
+
 // RecordWorkspaceStart increments the workspace start attempt counter for
 // ns/app with the given result.
 func RecordWorkspaceStart(ns, app, result string) {
