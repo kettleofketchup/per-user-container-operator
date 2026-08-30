@@ -489,8 +489,8 @@ spec:
                                 type: object
                                 x-kubernetes-map-type: atomic
                             type: object
-                          type: array
                           maxItems: 20
+                          type: array
                           x-kubernetes-list-type: atomic
                       type: object
                     maxItems: 20
