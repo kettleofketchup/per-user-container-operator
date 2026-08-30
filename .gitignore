@@ -2,6 +2,9 @@
 docs/superpowers/
 .superpowers/
 
+# Git worktrees used for implementation branches.
+.worktrees/
+
 # Go
 bin/
 dist/
