@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -620,5 +622,360 @@ func TestMemoryEmptyDirGetsDefaultSizeLimit(t *testing.T) {
 	d := RenderWorkspaceDeployment(app, validWorkspace())
 	if volumeByName(t, d, "m").EmptyDir.SizeLimit.String() != "16Mi" {
 		t.Fatal("memory-medium emptyDir must default to sizeLimit 16Mi")
+	}
+}
+
+// --- Task 11: router Deployment/Service/identity rendering ---
+
+const testRouterImage = "example.registry/router:v1"
+
+// routerArgs parses a rendered router container's Args into a flag->value
+// map, skipping the leading "router" subcommand token and failing the test
+// on anything that is not exactly one --flag=value.
+func routerArgs(t *testing.T, args []string) map[string]string {
+	t.Helper()
+	if len(args) == 0 || args[0] != "router" {
+		t.Fatalf("router container args must start with the %q subcommand, got %v", "router", args)
+	}
+	out := map[string]string{}
+	for _, a := range args[1:] {
+		trimmed := strings.TrimPrefix(a, "--")
+		if trimmed == a {
+			t.Fatalf("arg %q is not a --flag=value", a)
+		}
+		parts := strings.SplitN(trimmed, "=", 2)
+		if len(parts) != 2 {
+			t.Fatalf("arg %q is not --flag=value", a)
+		}
+		if _, dup := out[parts[0]]; dup {
+			t.Fatalf("flag %q rendered more than once", parts[0])
+		}
+		out[parts[0]] = parts[1]
+	}
+	return out
+}
+
+func routerContainer(t *testing.T, d *appsv1.Deployment) corev1.Container {
+	t.Helper()
+	for _, c := range d.Spec.Template.Spec.Containers {
+		if c.Name == "router" {
+			return c
+		}
+	}
+	t.Fatal(`router Deployment has no container named "router"`)
+	return corev1.Container{}
+}
+
+func volumeMountByName(t *testing.T, c corev1.Container, name string) corev1.VolumeMount {
+	t.Helper()
+	for _, m := range c.VolumeMounts {
+		if m.Name == name {
+			return m
+		}
+	}
+	t.Fatalf("container %q has no volumeMount named %q", c.Name, name)
+	return corev1.VolumeMount{}
+}
+
+func podVolumeByName(t *testing.T, d *appsv1.Deployment, name string) corev1.Volume {
+	t.Helper()
+	for _, v := range d.Spec.Template.Spec.Volumes {
+		if v.Name == name {
+			return v
+		}
+	}
+	t.Fatalf("pod spec has no volume named %q", name)
+	return corev1.Volume{}
+}
+
+// TestRouterDeploymentRendersExactlyTheTask10FlagList locks the Deployment's
+// Args to task-10-brief.md's startup contract verbatim: any drift here is
+// invisible to Task 10's own httptest-based suite (it never inspects how the
+// binary was invoked) and only surfaces as a router that fails to start or
+// silently ignores a spec field, discovered at Task 13.
+func TestRouterDeploymentRendersExactlyTheTask10FlagList(t *testing.T) {
+	app := validApp()
+	d, err := RenderRouterDeployment(app, testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	got := routerArgs(t, routerContainer(t, d).Args)
+
+	want := map[string]string{
+		"app":                     app.Name,
+		"namespace":               app.Namespace,
+		"identity-header":         app.Spec.Identity.Header,
+		"identity-max-length":     fmt.Sprintf("%d", app.Spec.Identity.MaxLength),
+		"caller-auth-header":      app.Spec.CallerAuth.Header,
+		"caller-auth-scheme":      app.Spec.CallerAuth.Scheme,
+		"caller-auth-secret-file": "/etc/puc/caller-auth/value",
+		"workspace-port":          fmt.Sprintf("%d", app.Spec.Workspace.Port),
+		"cold-start-hold":         (time.Duration(app.Spec.Router.ColdStartHoldSeconds) * time.Second).String(),
+		"connection-heartbeat":    app.Spec.Lifecycle.ConnectionHeartbeatInterval.Duration.String(),
+		"max-workspaces":          fmt.Sprintf("%d", app.Spec.Limits.MaxWorkspaces),
+		"listen-addr":             fmt.Sprintf(":%d", v1alpha1.RouterPort),
+		"metrics-addr":            fmt.Sprintf(":%d", v1alpha1.MetricsPort),
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("flag %q = %q, want %q (all flags: %v)", k, got[k], v, got)
+		}
+	}
+	for _, k := range []string{"upstream-auth-header", "upstream-auth-scheme", "upstream-auth-secret-file"} {
+		if v, ok := got[k]; ok {
+			t.Fatalf("flag %q=%q rendered with spec.workspace.upstreamAuth unset", k, v)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d flags %v, want exactly %d", len(got), got, len(want))
+	}
+}
+
+func TestRouterDeploymentOmitsCallerAuthSchemeWhenUnset(t *testing.T) {
+	app := validApp()
+	app.Spec.CallerAuth.Scheme = ""
+	d, err := RenderRouterDeployment(app, testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	got := routerArgs(t, routerContainer(t, d).Args)
+	if v, ok := got["caller-auth-scheme"]; ok {
+		t.Fatalf("caller-auth-scheme=%q rendered with an empty spec.callerAuth.scheme", v)
+	}
+}
+
+// TestRouterDeploymentSetsPodNameFromDownwardAPI: POD_NAME is in Task 10's
+// startup contract but is not a flag, so the flag-list assertion above passes
+// over its absence. An unset POD_NAME makes every router replica write
+// status.connections[""], one shared last-writer-wins entry across every
+// replica -- the reaper-kills-a-live-session failure spec 187-190 names.
+func TestRouterDeploymentSetsPodNameFromDownwardAPI(t *testing.T) {
+	d, err := RenderRouterDeployment(validApp(), testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	c := routerContainer(t, d)
+	for _, e := range c.Env {
+		if e.Name != "POD_NAME" {
+			continue
+		}
+		if e.ValueFrom == nil || e.ValueFrom.FieldRef == nil || e.ValueFrom.FieldRef.FieldPath != "metadata.name" {
+			t.Fatalf("POD_NAME must come from the downward API's metadata.name, got %+v", e)
+		}
+		return
+	}
+	t.Fatal("router container missing POD_NAME env var")
+}
+
+// TestRouterPortsAreTheSharedConstantsEverywhere is the "one number, three
+// dispatches" property: the Service targetPort, the container port, and (by
+// re-deriving) RenderRouterNetworkPolicy's ingress port must all be
+// v1alpha1.RouterPort, and the metrics port in all three must be
+// v1alpha1.MetricsPort -- asserted against the constants, never re-typed
+// numbers, so the three dispatches cannot silently drift from each other.
+func TestRouterPortsAreTheSharedConstantsEverywhere(t *testing.T) {
+	app := validApp()
+	d, err := RenderRouterDeployment(app, testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	svc := RenderRouterService(app)
+	c := routerContainer(t, d)
+
+	var containerRouterPort, containerMetricsPort int32
+	for _, p := range c.Ports {
+		switch p.Name {
+		case "http":
+			containerRouterPort = p.ContainerPort
+		case "metrics":
+			containerMetricsPort = p.ContainerPort
+		}
+	}
+	if containerRouterPort != v1alpha1.RouterPort {
+		t.Fatalf("container http port = %d, want v1alpha1.RouterPort", containerRouterPort)
+	}
+	if containerMetricsPort != v1alpha1.MetricsPort {
+		t.Fatalf("container metrics port = %d, want v1alpha1.MetricsPort", containerMetricsPort)
+	}
+
+	var svcRouterPort, svcMetricsPort int32
+	var svcRouterTarget, svcMetricsTarget intstr.IntOrString
+	for _, p := range svc.Spec.Ports {
+		switch p.Name {
+		case "http":
+			svcRouterPort, svcRouterTarget = p.Port, p.TargetPort
+		case "metrics":
+			svcMetricsPort, svcMetricsTarget = p.Port, p.TargetPort
+		}
+	}
+	if svcRouterPort != v1alpha1.RouterPort || svcRouterTarget.IntVal != v1alpha1.RouterPort {
+		t.Fatalf("router Service http port/targetPort must be v1alpha1.RouterPort, got port=%d targetPort=%v", svcRouterPort, svcRouterTarget)
+	}
+	if svcMetricsPort != v1alpha1.MetricsPort || svcMetricsTarget.IntVal != v1alpha1.MetricsPort {
+		t.Fatalf("router Service metrics port/targetPort must be v1alpha1.MetricsPort, got port=%d targetPort=%v", svcMetricsPort, svcMetricsTarget)
+	}
+
+	pol := RenderRouterNetworkPolicy(app, "10.42.0.0/16", "10.0.0.0/24")
+	var polRouterPort int32 = -1
+	for _, r := range pol.Spec.Ingress {
+		for _, peer := range r.From {
+			if peer.PodSelector == nil {
+				continue
+			}
+			for _, p := range r.Ports {
+				if p.Port != nil {
+					polRouterPort = p.Port.IntVal
+				}
+			}
+		}
+	}
+	if polRouterPort != v1alpha1.RouterPort {
+		t.Fatalf("router NetworkPolicy ingress port = %d, want v1alpha1.RouterPort", polRouterPort)
+	}
+}
+
+// TestRouterDeploymentMountsCallerAuthAtFixedFilename: a plain Secret volume
+// names each projected file after its key, so `key: api-key` (the value in
+// every fixture and both consumer CRs) puts the file at
+// /etc/puc/caller-auth/api-key unless items[0].path is pinned to "value" --
+// exactly what --caller-auth-secret-file names. Asserting the flag list or
+// the mount path alone passes over a Deployment whose flags name paths that
+// do not exist.
+func TestRouterDeploymentMountsCallerAuthAtFixedFilename(t *testing.T) {
+	app := validApp()
+	d, err := RenderRouterDeployment(app, testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	c := routerContainer(t, d)
+	mount := volumeMountByName(t, c, "caller-auth")
+	if mount.MountPath != "/etc/puc/caller-auth" || !mount.ReadOnly {
+		t.Fatalf("caller-auth mount = %+v, want path /etc/puc/caller-auth, readOnly", mount)
+	}
+	vol := podVolumeByName(t, d, "caller-auth")
+	if vol.Secret == nil || vol.Secret.SecretName != app.Spec.CallerAuth.SecretRef.Name {
+		t.Fatalf("caller-auth volume must be a Secret volume named %q, got %+v", app.Spec.CallerAuth.SecretRef.Name, vol)
+	}
+	if len(vol.Secret.Items) != 1 || vol.Secret.Items[0].Key != app.Spec.CallerAuth.SecretRef.Key || vol.Secret.Items[0].Path != "value" {
+		t.Fatalf("caller-auth volume must project key %q onto path %q, got %+v", app.Spec.CallerAuth.SecretRef.Key, "value", vol.Secret.Items)
+	}
+}
+
+func TestRouterDeploymentOmitsUpstreamAuthWhenUnset(t *testing.T) {
+	d, err := RenderRouterDeployment(validApp(), testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	for _, v := range d.Spec.Template.Spec.Volumes {
+		if v.Name == "upstream-auth" {
+			t.Fatal("upstream-auth volume rendered with spec.workspace.upstreamAuth unset")
+		}
+	}
+	for _, m := range routerContainer(t, d).VolumeMounts {
+		if m.Name == "upstream-auth" {
+			t.Fatal("upstream-auth volumeMount rendered with spec.workspace.upstreamAuth unset")
+		}
+	}
+}
+
+func TestRouterDeploymentMountsUpstreamAuthWhenSet(t *testing.T) {
+	app := validApp()
+	app.Spec.Workspace.UpstreamAuth = &v1alpha1.SecretHeaderRef{
+		SecretRef: corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "upstream-secret"}, Key: "token"},
+		Header:    "X-Upstream-Auth",
+		Scheme:    "Bearer",
+	}
+	d, err := RenderRouterDeployment(app, testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	c := routerContainer(t, d)
+	got := routerArgs(t, c.Args)
+	if got["upstream-auth-header"] != "X-Upstream-Auth" || got["upstream-auth-scheme"] != "Bearer" || got["upstream-auth-secret-file"] != "/etc/puc/upstream-auth/value" {
+		t.Fatalf("upstream-auth-* flags not rendered correctly: %v", got)
+	}
+	mount := volumeMountByName(t, c, "upstream-auth")
+	if mount.MountPath != "/etc/puc/upstream-auth" || !mount.ReadOnly {
+		t.Fatalf("upstream-auth mount = %+v", mount)
+	}
+	vol := podVolumeByName(t, d, "upstream-auth")
+	if vol.Secret == nil || vol.Secret.SecretName != "upstream-secret" || len(vol.Secret.Items) != 1 ||
+		vol.Secret.Items[0].Key != "token" || vol.Secret.Items[0].Path != "value" {
+		t.Fatalf("upstream-auth volume malformed: %+v", vol)
+	}
+}
+
+func TestRouterDeploymentFailsFastWithNoResolvableImage(t *testing.T) {
+	app := validApp()
+	app.Spec.Router.Image = ""
+	if _, err := RenderRouterDeployment(app, ""); err == nil {
+		t.Fatal("expected error when neither spec.router.Image nor RELATED_IMAGE_ROUTER (the passed default) is set")
+	}
+}
+
+func TestRouterDeploymentSpecImageOverridesDefault(t *testing.T) {
+	app := validApp()
+	app.Spec.Router.Image = "dev/router:local"
+	d, err := RenderRouterDeployment(app, testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	if got := routerContainer(t, d).Image; got != "dev/router:local" {
+		t.Fatalf("container image = %q, want spec.router.Image override %q", got, "dev/router:local")
+	}
+}
+
+// TestRouterDeploymentAndServiceStampedWithSharedLabels is the precondition
+// for Task 12's ServiceMonitor selecting anything at all: RouterPodLabels
+// (Task 5), this task's stamping, and Task 12's selector are three separate
+// dispatches, and a mismatch on any of the three strings makes the
+// ServiceMonitor select nothing -- no error, just no series.
+func TestRouterDeploymentAndServiceStampedWithSharedLabels(t *testing.T) {
+	app := validApp()
+	d, err := RenderRouterDeployment(app, testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	svc := RenderRouterService(app)
+	want := RouterPodLabels(app.Name)
+	for k, v := range want {
+		if d.Spec.Template.Labels[k] != v {
+			t.Fatalf("router pod template missing label %s=%s", k, v)
+		}
+		if svc.Labels[k] != v || svc.Spec.Selector[k] != v {
+			t.Fatalf("router Service missing label/selector %s=%s", k, v)
+		}
+	}
+	if want[v1alpha1.LabelComponent] != v1alpha1.ComponentRouter || want[v1alpha1.LabelPartOf] != v1alpha1.PartOfValue {
+		t.Fatal("RouterPodLabels must carry ComponentRouter and PartOfValue")
+	}
+	if *d.Spec.Replicas != app.Spec.Router.Replicas {
+		t.Fatalf("replicas = %d, want spec.router.replicas %d", *d.Spec.Replicas, app.Spec.Router.Replicas)
+	}
+	if d.Spec.Template.Spec.ServiceAccountName != app.Name+"-router" {
+		t.Fatalf("router pod serviceAccountName = %q, want %q", d.Spec.Template.Spec.ServiceAccountName, app.Name+"-router")
+	}
+}
+
+func TestWorkspaceServiceAccountNamedByConventionAndNoRoleBindingRendered(t *testing.T) {
+	app := validApp()
+	sa := RenderWorkspaceServiceAccount(app)
+	if sa.Name != app.Name+"-workspace" || sa.Namespace != app.Namespace {
+		t.Fatalf("workspace SA = %s/%s, want %s/%s-workspace", sa.Namespace, sa.Name, app.Namespace, app.Name)
+	}
+}
+
+func TestRouterServiceAccountAndRoleBindingNamedByConvention(t *testing.T) {
+	app := validApp()
+	sa := RenderRouterServiceAccount(app)
+	if sa.Name != app.Name+"-router" || sa.Namespace != app.Namespace {
+		t.Fatalf("router SA = %s/%s, want %s/%s-router", sa.Namespace, sa.Name, app.Namespace, app.Name)
+	}
+	rb := RenderRouterRoleBinding(app)
+	if rb.RoleRef.Name != v1alpha1.RouterRoleName || rb.RoleRef.Kind != "Role" {
+		t.Fatalf("router RoleBinding roleRef = %+v, want Role/%s", rb.RoleRef, v1alpha1.RouterRoleName)
+	}
+	if len(rb.Subjects) != 1 || rb.Subjects[0].Name != sa.Name || rb.Subjects[0].Namespace != app.Namespace || rb.Subjects[0].Kind != "ServiceAccount" {
+		t.Fatalf("router RoleBinding subject mismatch: %+v, want ServiceAccount %s/%s", rb.Subjects, app.Namespace, sa.Name)
 	}
 }
