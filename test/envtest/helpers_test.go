@@ -159,6 +159,33 @@ func gatherMetric(t *testing.T, name string, want map[string]string) (float64, b
 	return 0, false
 }
 
+// waitForMetricValue polls until the gauge/counter/histogram-samplecount
+// value at name{labels} equals want, or fails with the last observed value.
+// Presence alone (gatherMetric's `found`) is not sufficient for a
+// gauge-backed series: a reconciler that always writes 0 for
+// puc_workspaces{phase} would still make `found` true, which is exactly the
+// registered-and-always-zero failure mode a Failed-ratio alert would
+// evaluate on and never fire from. Refreshing gauges runs at the start of a
+// reconcile, before that pass's own phase transition is computed and
+// persisted, so the settled value can lag one reconcile behind a phase
+// change observed via the API -- poll rather than checking once.
+func waitForMetricValue(t *testing.T, timeout time.Duration, name string, labels map[string]string, want float64) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastVal float64
+	var lastFound bool
+	for {
+		lastVal, lastFound = gatherMetric(t, name, labels)
+		if lastFound && lastVal == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("metric %s{%v} = %v (found=%v) after %s, want %v", name, labels, lastVal, lastFound, timeout, want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func matchLabels(m *dto.Metric, want map[string]string) bool {
 	got := map[string]string{}
 	for _, lp := range m.GetLabel() {

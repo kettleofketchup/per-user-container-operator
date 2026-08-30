@@ -670,18 +670,28 @@ func TestWorkspaceLoopSeriesAreRecorded(t *testing.T) {
 	forgeReadyReplicas(t, ns, depName, 1)
 	waitForPhase(t, ws, v1alpha1.PhaseReady)
 
-	checks := []struct {
+	// Gauge-backed series: assert the VALUE, not just presence. A
+	// reconciler that always wrote 0 here would still make a bare presence
+	// check pass -- exactly the registered-and-always-zero mode that
+	// leaves a Failed-ratio alert evaluating on a series nothing writes.
+	// There is exactly one Workspace, in Ready, owning one PVC, in this
+	// namespace/app.
+	waitForMetricValue(t, 5*time.Second, "puc_workspaces", map[string]string{"namespace": ns, "app": app.Name, "phase": string(v1alpha1.PhaseReady)}, 1)
+	waitForMetricValue(t, 5*time.Second, "puc_workspace_pvcs_total", map[string]string{"namespace": ns, "app": app.Name}, 1)
+	waitForMetricValue(t, 5*time.Second, "puc_workspace_user_info", map[string]string{"namespace": ns, "app": app.Name, "user_key": ws.Spec.UserKey}, 1)
+
+	// Counter/histogram-backed series only exist in the registry once
+	// incremented/observed at least once, so presence alone is meaningful
+	// here (unlike the gauges above).
+	presenceChecks := []struct {
 		name   string
 		labels map[string]string
 	}{
-		{"puc_workspaces", map[string]string{"namespace": ns, "app": app.Name, "phase": string(v1alpha1.PhaseReady)}},
-		{"puc_workspace_pvcs_total", map[string]string{"namespace": ns, "app": app.Name}},
-		{"puc_workspace_user_info", map[string]string{"namespace": ns, "app": app.Name, "user_key": ws.Spec.UserKey}},
 		{"puc_workspace_starts_total", map[string]string{"namespace": ns, "app": app.Name, "result": "admitted"}},
 		{"puc_workspace_start_seconds", map[string]string{"namespace": ns, "app": app.Name}},
 		{"puc_reconcile_errors_total", map[string]string{"namespace": ns, "app": app.Name, "kind": "app_not_found"}},
 	}
-	for _, c := range checks {
+	for _, c := range presenceChecks {
 		if _, found := gatherMetric(t, c.name, c.labels); !found {
 			t.Fatalf("metric %s{%v} not found in registry", c.name, c.labels)
 		}
