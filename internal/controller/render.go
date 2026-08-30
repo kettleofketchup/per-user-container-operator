@@ -461,6 +461,15 @@ func ValidateApp(app *v1alpha1.PerUserApp) (warnings []string, err error) {
 		return nil, fmt.Errorf("spec.workspace.serviceAccountName: %q is the operator's own service account and must never be assigned to a workspace pod", v1alpha1.OperatorServiceAccountName)
 	}
 
+	// RenderWorkspaceDeployment always renders automountServiceAccountToken:
+	// false on the workspace pod, regardless of this field: the workspace SA
+	// is deliberately tokenless. An explicit true here is dead config that
+	// the API server accepts silently, so surface the mismatch loudly rather
+	// than let it stand as a contract nobody honors.
+	if b := app.Spec.Workspace.AutomountServiceAccountToken; b != nil && *b {
+		return nil, fmt.Errorf("spec.workspace.automountServiceAccountToken: true is rejected; the workspace ServiceAccount is deliberately tokenless and this value is always rendered false")
+	}
+
 	if app.Spec.Workspace.PodSecurityContext.FSGroup == nil {
 		return nil, fmt.Errorf("spec.workspace.podSecurityContext.fsGroup: required; a freshly provisioned volume is root-owned without it and the workspace container cannot write to it")
 	}

@@ -63,6 +63,31 @@ func admitsNodeCIDR(t *testing.T, pols []*networkingv1.NetworkPolicy, cidr strin
 	return false
 }
 
+// nodeCIDRIngressPort returns the numeric port admitted on the ingress rule
+// whose peer is an ipBlock matching cidr, failing the test if no such rule
+// exists or it names no port. Unlike admitsNodeCIDR, this reads r.Ports: a
+// resolver that reintroduces the port-0 bug (reading a named probe port's
+// IntVal directly instead of resolving it) renders a rule for port 0, which
+// admitsNodeCIDR alone cannot see since it only checks the CIDR peer.
+func nodeCIDRIngressPort(t *testing.T, pols []*networkingv1.NetworkPolicy, cidr string) int32 {
+	t.Helper()
+	for _, p := range pols {
+		for _, r := range p.Spec.Ingress {
+			for _, peer := range r.From {
+				if peer.IPBlock == nil || peer.IPBlock.CIDR != cidr {
+					continue
+				}
+				if len(r.Ports) == 0 || r.Ports[0].Port == nil {
+					t.Fatalf("ingress rule admitting CIDR %q names no port", cidr)
+				}
+				return r.Ports[0].Port.IntVal
+			}
+		}
+	}
+	t.Fatalf("no ingress rule admits CIDR %q", cidr)
+	return 0
+}
+
 // mountPathOf returns the mount path of the named volume mount on c, failing
 // the test if it is not mounted there.
 func mountPathOf(t *testing.T, c corev1.Container, volumeName string) string {
@@ -139,6 +164,34 @@ func TestValidateRejectsOperatorServiceAccountName(t *testing.T) {
 	if _, err := ValidateApp(app); err == nil {
 		t.Fatal("operator SA accepted as the workspace SA")
 	}
+}
+
+// RenderWorkspaceDeployment always renders automountServiceAccountToken:
+// false regardless of this field (render.go), so an explicit true is dead
+// config the API server would otherwise accept silently. nil and explicit
+// false both describe the actual rendered behavior and must stay valid.
+func TestValidateRejectsAutomountServiceAccountTokenTrue(t *testing.T) {
+	t.Run("explicit true rejected", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Workspace.AutomountServiceAccountToken = testfixtures.Ptr(true)
+		if _, err := ValidateApp(app); err == nil {
+			t.Fatal("automountServiceAccountToken:true accepted; the value is always rendered false, so this is dead config the API server silently ignores")
+		}
+	})
+	t.Run("explicit false stays valid", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Workspace.AutomountServiceAccountToken = testfixtures.Ptr(false)
+		if _, err := ValidateApp(app); err != nil {
+			t.Fatalf("automountServiceAccountToken:false rejected: %v", err)
+		}
+	})
+	t.Run("nil stays valid", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Workspace.AutomountServiceAccountToken = nil
+		if _, err := ValidateApp(app); err != nil {
+			t.Fatalf("automountServiceAccountToken:nil rejected: %v", err)
+		}
+	})
 }
 
 func TestValidateRequiresFsGroupAndNumericUser(t *testing.T) {
@@ -267,6 +320,140 @@ func TestWorkspaceIngressSelectsAllThreeRouterLabels(t *testing.T) {
 	// Kubelet probes must be admitted or every cold start dies at startupTimeout.
 	if !admitsNodeCIDR(t, pols, "10.0.0.0/24") {
 		t.Fatal("node CIDR not admitted on the probe port")
+	}
+}
+
+// admitsNodeCIDR only checks the CIDR peer, not the port the rule admits —
+// a resolver that renders a rule for port 0 (the port-0 bug resolveProbePort
+// exists to prevent) would still pass that check. This test reads the port
+// value directly, with a named readinessProbe port that only resolves
+// correctly if it is looked up against the declared container port rather
+// than read as a raw IntOrString.
+func TestWorkspaceIngressAdmitsResolvedProbePort(t *testing.T) {
+	app := validApp()
+	app.Spec.Workspace.Port = 9000
+	app.Spec.Workspace.ReadinessProbe = &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromString("http")}},
+	}
+	pols := RenderWorkspaceNetworkPolicies(app, validWorkspace(), "10.42.0.0/16", "10.0.0.0/24")
+	if got := nodeCIDRIngressPort(t, pols, "10.0.0.0/24"); got != 9000 {
+		t.Fatalf("node CIDR ingress port = %d, want 9000 (resolved via the declared %q container port); a naive raw read of a named IntOrString yields 0 and blocks every kubelet probe", got, "http")
+	}
+}
+
+// resolveProbePort is exercised only indirectly by the network-policy tests
+// above (which never varied the probe declaration), so its branches are
+// tested directly here: absent probe, a named port that resolves, a named
+// port that does not resolve, and a numeric literal.
+func TestResolveProbePort(t *testing.T) {
+	t.Run("no probe falls back to workspace port", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Workspace.Port = 9000
+		app.Spec.Workspace.ReadinessProbe = nil
+		if got := resolveProbePort(app); got != 9000 {
+			t.Fatalf("resolveProbePort = %d, want 9000", got)
+		}
+	})
+	t.Run("named port resolves against the declared container port", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Workspace.Port = 9000
+		app.Spec.Workspace.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromString("http")}},
+		}
+		if got := resolveProbePort(app); got != 9000 {
+			t.Fatalf(`resolveProbePort = %d, want 9000 (resolved via the declared "http" container port)`, got)
+		}
+	})
+	t.Run("unknown port name falls back to workspace port", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Workspace.Port = 9000
+		app.Spec.Workspace.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromString("metrics")}},
+		}
+		if got := resolveProbePort(app); got != 9000 {
+			t.Fatalf("resolveProbePort = %d, want fallback 9000", got)
+		}
+	})
+	t.Run("numeric literal port used verbatim", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Workspace.Port = 9000
+		app.Spec.Workspace.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromInt(7777)}},
+		}
+		if got := resolveProbePort(app); got != 7777 {
+			t.Fatalf("resolveProbePort = %d, want the literal numeric port 7777", got)
+		}
+	})
+}
+
+// RenderRouterNetworkPolicy had zero coverage: a divergence here is
+// invisible to every unit suite and only surfaces at Task 13 as a Service
+// with no reachable endpoint. Ports come from the v1alpha1 constants, not
+// re-typed, so a drift between this render and Task 11's Deployment/Service
+// would be caught here too.
+func TestRouterNetworkPolicyAdmitsDeclaredIngressAndScopesEgress(t *testing.T) {
+	app := validApp()
+	pol := RenderRouterNetworkPolicy(app, "10.42.0.0/16", "10.0.0.0/24")
+
+	var admitsDeclaredPeer, admitsPodCIDRMetrics bool
+	for _, r := range pol.Spec.Ingress {
+		for _, peer := range r.From {
+			if peer.PodSelector != nil && peer.PodSelector.MatchLabels["app.kubernetes.io/name"] == "caller" {
+				for _, p := range r.Ports {
+					if p.Port != nil && p.Port.IntVal == v1alpha1.RouterPort {
+						admitsDeclaredPeer = true
+					}
+				}
+			}
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == "10.42.0.0/16" {
+				for _, p := range r.Ports {
+					if p.Port != nil && p.Port.IntVal == v1alpha1.MetricsPort {
+						admitsPodCIDRMetrics = true
+					}
+				}
+			}
+		}
+	}
+	if !admitsDeclaredPeer {
+		t.Fatal("router ingress does not admit the declared routerIngress.from peer on RouterPort")
+	}
+	if !admitsPodCIDRMetrics {
+		t.Fatal("router ingress does not admit the pod CIDR on MetricsPort; Task 13's Prometheus assertion has no data without this")
+	}
+
+	var udp53, tcp53, admitsNode, admitsPod bool
+	for _, r := range pol.Spec.Egress {
+		for _, port := range r.Ports {
+			if port.Port == nil || port.Port.IntValue() != 53 {
+				continue
+			}
+			if port.Protocol != nil && *port.Protocol == corev1.ProtocolUDP {
+				udp53 = true
+			}
+			if port.Protocol != nil && *port.Protocol == corev1.ProtocolTCP {
+				tcp53 = true
+			}
+		}
+		for _, peer := range r.To {
+			if peer.IPBlock == nil {
+				continue
+			}
+			if peer.IPBlock.CIDR == "10.0.0.0/24" {
+				admitsNode = true
+			}
+			if peer.IPBlock.CIDR == "10.42.0.0/16" {
+				admitsPod = true
+			}
+		}
+	}
+	if !udp53 || !tcp53 {
+		t.Fatalf("router egress missing DNS rule (udp53=%v tcp53=%v)", udp53, tcp53)
+	}
+	if !admitsNode {
+		t.Fatal("router egress does not admit the node CIDR; the router cannot reach the apiserver and every Workspace create/status patch fails")
+	}
+	if !admitsPod {
+		t.Fatal("router egress does not admit the pod CIDR; the router cannot reach any workspace Service")
 	}
 }
 
