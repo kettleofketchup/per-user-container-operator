@@ -136,16 +136,20 @@ func TestResolveCachesUntilInvalidated(t *testing.T) {
 
 // watchCapture records every watch.Interface a wrapped client.WithWatch
 // hands out, via an interceptor, so a test can reach in and Stop() one from
-// outside the goroutine that's consuming it.
+// outside the goroutine that's consuming it. It also timestamps each call,
+// so a test can measure the gap between one watch ending and the next
+// being established (the reconnect backoff actually in effect).
 type watchCapture struct {
 	mu      sync.Mutex
 	watches []watch.Interface
+	times   []time.Time
 }
 
 func (c *watchCapture) record(w watch.Interface) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.watches = append(c.watches, w)
+	c.times = append(c.times, time.Now())
 }
 
 func (c *watchCapture) count() int {
@@ -158,6 +162,12 @@ func (c *watchCapture) at(i int) watch.Interface {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.watches[i]
+}
+
+func (c *watchCapture) timeAt(i int) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.times[i]
 }
 
 func newCapturingWatchClient(t *testing.T, base client.WithWatch) (client.WithWatch, *watchCapture) {
@@ -237,4 +247,66 @@ func TestWatchServiceDeletesReconnectsAfterChannelCloses(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("cache was never invalidated after the watch reconnected and observed the delete -- the watch loop must reconnect on channel close, not exit (fire-and-forget bug)")
+}
+
+// TestWatchReconnectBackoffResetsAfterAHealthySession is the fix for
+// Finding 5: nextBackoff only ever ratchets upward, and nothing ever reset
+// it back down. Kubernetes closes a watch roughly every
+// --min-request-timeout on every long-lived, otherwise-healthy connection,
+// so a pod up for days would permanently reconnect at the backoff CEILING
+// rather than the floor — leaving a recurring window, after every routine
+// close, during which Resolver.Invalidate cannot fire. That is the same
+// failure class the CRITICAL finding was about, just narrower and
+// repeating instead of permanent.
+//
+// This test forces exactly one ratchet (watch #1 is killed essentially
+// instantly, well under ReconnectMinBackoff, so it counts as unhealthy),
+// then lets watch #2 run HEALTHILY — open longer than ReconnectMinBackoff —
+// before closing it, and asserts the gap before watch #3 is established is
+// close to ReconnectMinBackoff, not the ratcheted-again ~4x value a
+// permanently-ratcheting implementation would produce.
+func TestWatchReconnectBackoffResetsAfterAHealthySession(t *testing.T) {
+	ns := "ns-backoff-reset"
+	svc := serviceFor(ns, "svc-a", "10.0.0.5", 8000)
+	fc := newFakeClient(t, svc)
+	wrapped, watches := newCapturingWatchClient(t, fc)
+
+	// minBackoff is deliberately not tiny: the gap this test measures needs
+	// enough headroom over scheduling jitter to distinguish "reset to
+	// minBackoff" (~40ms) from "ratcheted to 2*minBackoff" (~80ms) cleanly.
+	const minBackoff = 40 * time.Millisecond
+	r := NewResolver(fc)
+	r.ReconnectMinBackoff = minBackoff
+	r.ReconnectMaxBackoff = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = r.WatchServiceDeletes(ctx, wrapped, ns) }()
+
+	// Watch #1: unhealthy (killed essentially immediately, well under
+	// minBackoff) -- forces exactly one ratchet, minBackoff -> 2*minBackoff.
+	waitUntil(t, 2*time.Second, func() bool { return watches.count() >= 1 })
+	watches.at(0).Stop()
+
+	// Watch #2 is established after that ratcheted (~2*minBackoff) delay.
+	waitUntil(t, 2*time.Second, func() bool { return watches.count() >= 2 })
+
+	// Let watch #2 run HEALTHILY: stay open longer than minBackoff before
+	// closing it, so its session counts as healthy under the reset rule
+	// this fix adds.
+	time.Sleep(minBackoff + 30*time.Millisecond)
+	stoppedAt := time.Now()
+	watches.at(1).Stop()
+
+	// Watch #3 is the reconnect after a HEALTHY session. A fix that resets
+	// on a healthy session waits ~minBackoff (~40ms) here; an
+	// always-ratcheting implementation instead continues from the 2x
+	// already in effect and waits ~2*minBackoff (~80ms). The threshold
+	// (1.5x minBackoff = 60ms) sits cleanly between the two.
+	waitUntil(t, 2*time.Second, func() bool { return watches.count() >= 3 })
+	gap := watches.timeAt(2).Sub(stoppedAt)
+
+	if gap > minBackoff+minBackoff/2 {
+		t.Fatalf("reconnect after a healthy watch session waited %v, want close to minBackoff (%v) -- backoff must reset after a session that ran healthily, not keep ratcheting toward the ceiling", gap, minBackoff)
+	}
 }

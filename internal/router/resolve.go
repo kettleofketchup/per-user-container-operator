@@ -180,6 +180,21 @@ func (r *Resolver) HandleWorkspaceEvent(evt watch.Event) {
 // address was later reassigned to. Exiting only on ctx cancellation is the
 // fix; newList is called fresh on every (re)connect attempt since a
 // client.ObjectList used for one Watch call must not be reused for another.
+//
+// The backoff RESETS to minBackoff once an established watch's session
+// (from a successful Watch call to its channel closing) lasts at least
+// minBackoff — the simplest rule that doesn't depend on this watch ever
+// seeing an event: a delete-watch on a quiet namespace can go its entire
+// life without one, so "reset on first event" would leave the backoff
+// ratcheted forever right alongside the bug this fixes. A session that
+// merely outlives the delay we'd have backed off for anyway has
+// demonstrably not just failed, and rewarding it with a reset matters
+// because routine --min-request-timeout closes happen on every long-lived,
+// otherwise-healthy watch: without the reset, a pod up for days ends up
+// permanently reconnecting at maxBackoff instead of minBackoff, leaving a
+// recurring window — after every one of those routine closes — during
+// which Invalidate cannot fire. Narrower than the fire-and-forget bug above,
+// but the same failure shape, repeating instead of permanent.
 func watchDeletes(ctx context.Context, wc client.WithWatch, newList func() client.ObjectList, opts []client.ListOption, onDelete func(evt watch.Event), minBackoff, maxBackoff time.Duration) {
 	backoff := minBackoff
 	for {
@@ -199,15 +214,27 @@ func watchDeletes(ctx context.Context, wc client.WithWatch, newList func() clien
 			continue
 		}
 
+		sessionStart := time.Now()
 		drainUntilClosedOrDone(ctx, w, onDelete)
 		w.Stop()
 		if ctx.Err() != nil {
 			return
 		}
 
-		// The channel closed (a routine server-side timeout, the common
-		// case) or a transient recv error occurred; back off before
-		// reconnecting so a persistently broken connection does not spin.
+		if time.Since(sessionStart) >= minBackoff {
+			// Healthy session: reset before sleeping, so the upcoming
+			// reconnect uses the floor, not whatever the backoff had
+			// ratcheted up to.
+			backoff = minBackoff
+			if !sleepOrDone(ctx, backoff) {
+				return
+			}
+			continue
+		}
+
+		// Unhealthy session (closed/errored before proving itself): back
+		// off before reconnecting so a persistently broken connection does
+		// not spin, and ratchet for next time.
 		if !sleepOrDone(ctx, backoff) {
 			return
 		}
