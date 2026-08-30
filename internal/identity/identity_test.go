@@ -40,6 +40,13 @@ func TestExtractRejections(t *testing.T) {
 		// passes for the wrong reason, because the merged key resolves to a
 		// third workspace that is neither the attacker's nor the victim's.
 		{"comma joined", hdr(H, "alice, bob"), ReasonDuplicate, 400},
+		// http.Header canonicalizes both the stored key and the lookup
+		// argument, so a header sent as "x-user-id" and one sent as
+		// "X-User-Id" merge into a single two-element Values() slice rather
+		// than being treated as distinct headers. This must land in the
+		// same len(values) > 1 rejection as two same-case duplicates, not
+		// slip through as a single value.
+		{"case differing header names", hdr("x-user-id", "alice", H, "bob"), ReasonDuplicate, 400},
 		{"non printable", hdr(H, "al\x00ice"), ReasonInvalid, 400},
 		{"high byte", hdr(H, "ali\xffce"), ReasonInvalid, 400},
 	}
