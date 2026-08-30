@@ -72,8 +72,27 @@ type RouterIngressSpec struct {
 // NetworkSpec configures the NetworkPolicies rendered for this app's
 // workspaces and router.
 //
+// The workspaceEgress CEL rule below nests two unbounded arrays
+// (workspaceEgress itself, and each rule's to peers). Without a maxItems
+// bound on both, the API server's CEL cost estimator refuses to install
+// this CRD at all ("estimated rule cost exceeds budget"): the estimator
+// prices the nested self.workspaceEgress.all(r, r.to.all(...)) as
+// N (outer length) * M (inner length), and an unbounded array's assumed
+// worst-case cardinality is large enough that the product blows the
+// budget by orders of magnitude. The maxItems:20 below bounds N;
+// controller-gen cannot bound M (r.to) because that field is declared on
+// the upstream networkingv1.NetworkPolicyEgressRule type, not here — so
+// config/crd/apps.kettleofketchup_peruserapps.yaml carries a matching
+// maxItems:20 hand-patched onto network.workspaceEgress.items.properties.to.
+// `make manifests` will NOT reproduce that patch (controller-gen has no
+// marker to attach there); until Task 4/5's API design gives egress peers
+// a bounded first-party type, `make manifests` output for this field must
+// be re-patched by hand and TestSelectorEgressPeerIsRejectedByTheAPIServer
+// (test/envtest/cel_test.go) re-run to confirm the CRD still installs.
+//
 // +kubebuilder:validation:XValidation:rule="self.workspaceEgress.all(r, r.to.size() > 0 && r.to.all(p, has(p.ipBlock)))",message="every workspaceEgress rule needs a non-empty to, and every peer must be ipBlock: an absent to means allow-to-anywhere, and Calico evaluates egress pre-DNAT so a selector-based peer renders, applies and silently drops"
 type NetworkSpec struct {
+	// +kubebuilder:validation:MaxItems=20
 	WorkspaceEgress []networkingv1.NetworkPolicyEgressRule `json:"workspaceEgress"`
 	RouterIngress   RouterIngressSpec                      `json:"routerIngress"`
 }
