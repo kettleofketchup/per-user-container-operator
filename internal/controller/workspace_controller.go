@@ -34,14 +34,16 @@ import (
 // or not.
 const workspaceFinalizer = "puc.kettleofketchup/workspace-cleanup"
 
-// Admitter decides whether a Pending Workspace may proceed to Starting and
-// records the reason a Starting Workspace failed. Task 6 declares this
-// interface and wires a permissive stub; Task 8 supplies the real
-// implementation (FIFO admission on enqueuedAt, maxConcurrentStarts,
-// migration gating, backoff arithmetic) and swaps it in at the controller
-// entrypoint. See task-6-brief.md's admission seam section for why the split
-// is here rather than left implicit.
-type Admitter interface {
+// WorkspaceAdmitter decides whether a Pending Workspace may proceed to
+// Starting and records the reason a Starting Workspace failed. Task 6
+// declares this interface; Task 8's admission.go supplies the real
+// implementation (the exported concrete type *Admitter* -- a distinct name
+// from this interface, both living in this package -- FIFO admission on
+// enqueuedAt, maxConcurrentStarts, migration gating, backoff arithmetic) and
+// both admitter() and SetupWithManager default to it when the caller has not
+// set one. See task-6-brief.md's admission seam section for why the split is
+// here rather than left implicit.
+type WorkspaceAdmitter interface {
 	// TryAdmit reports whether ws may transition Pending -> Starting.
 	TryAdmit(ctx context.Context, ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp) (bool, error)
 	// RecordStartFailure is called on both Starting -> Failed rows this
@@ -51,20 +53,6 @@ type Admitter interface {
 	// counter is a rate input with no per-call delta assertion on both
 	// emitters at once.
 	RecordStartFailure(ctx context.Context, ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp, reason string) error
-}
-
-// permissiveAdmitter admits every Pending Workspace immediately and records
-// nothing on start failure. It is the WorkspaceReconciler's default Admitter
-// until Task 8 wires the real implementation at the controller entrypoint;
-// tests targeting the admission seam itself substitute a recording stub.
-type permissiveAdmitter struct{}
-
-func (permissiveAdmitter) TryAdmit(context.Context, *v1alpha1.Workspace, *v1alpha1.PerUserApp) (bool, error) {
-	return true, nil
-}
-
-func (permissiveAdmitter) RecordStartFailure(context.Context, *v1alpha1.Workspace, *v1alpha1.PerUserApp, string) error {
-	return nil
 }
 
 // Default poll/requeue intervals, overridable per-reconciler for fast tests.
@@ -89,8 +77,9 @@ type WorkspaceReconciler struct {
 	Scheme *runtime.Scheme
 
 	// Admitter gates Pending -> Starting and records Starting -> Failed
-	// reasons. Defaults to a permissive stub when nil (see admitter()).
-	Admitter Admitter
+	// reasons. Defaults to the real admission.go implementation, bound to
+	// this reconciler's own Client, when nil (see admitter()).
+	Admitter WorkspaceAdmitter
 
 	// Name overrides the controller-runtime controller name (default
 	// "workspace"). controller-runtime tracks controller names uniquely per
@@ -118,10 +107,11 @@ type WorkspaceReconciler struct {
 }
 
 // SetupWithManager wires the WorkspaceReconciler into mgr, defaulting
-// Admitter to the permissive stub when the caller has not set one.
+// Admitter to the real implementation (admission.go's Admitter, bound to
+// this reconciler's own Client) when the caller has not set one.
 func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Admitter == nil {
-		r.Admitter = permissiveAdmitter{}
+		r.Admitter = NewAdmitter(r.Client)
 	}
 	name := r.Name
 	if name == "" {
@@ -136,9 +126,9 @@ func (r *WorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-func (r *WorkspaceReconciler) admitter() Admitter {
+func (r *WorkspaceReconciler) admitter() WorkspaceAdmitter {
 	if r.Admitter == nil {
-		return permissiveAdmitter{}
+		return NewAdmitter(r.Client)
 	}
 	return r.Admitter
 }
@@ -455,8 +445,9 @@ func (r *WorkspaceReconciler) failStarting(ctx context.Context, ws *v1alpha1.Wor
 }
 
 // reconcileFailed implements the Failed->Pending row: a user's retry is the
-// fast path, gated purely on backoffUntil (Task 8's arithmetic; the
-// permissive stub never sets it, so a workspace it fails stays Failed).
+// fast path, gated purely on backoffUntil (Task 8's arithmetic; a recording
+// test stub that never sets it leaves a workspace it fails stuck Failed,
+// which is what the recordingAdmitter-based envtest coverage relies on).
 func (r *WorkspaceReconciler) reconcileFailed(_ context.Context, ws *v1alpha1.Workspace, _ *v1alpha1.PerUserApp) (ctrl.Result, error) {
 	if ws.Status.BackoffUntil != nil && r.now().After(ws.Status.BackoffUntil.Time) {
 		ws.Status.Phase = v1alpha1.PhasePending
