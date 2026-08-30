@@ -1,0 +1,6 @@
+apiVersion: v2
+name: per-user-container-operator
+description: Gives each user of an HTTP application their own container and volume.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

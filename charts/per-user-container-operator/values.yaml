@@ -1,0 +1,42 @@
+# watchNamespaces is the single source of truth for every namespace this
+# operator serves. It renders the per-namespace controller Role, the
+# per-namespace router Role, the RoleBindings binding the controller's own
+# ServiceAccount to the controller Role in each, the router ServiceMonitor's
+# namespaceSelector.matchNames, AND the controller Deployment's
+# --watch-namespaces flag -- all four from this one list, so none of them can
+# drift onto a different namespace set.
+watchNamespaces: []
+
+# clusterPodCIDR / nodeCIDR feed the controller's --pod-cidr / --node-cidr
+# flags, which the render functions in internal/controller/render.go need to
+# build the workspace and router NetworkPolicies. Left empty by default
+# because there is no safe cluster-wide guess; the controller itself refuses
+# to start without both set.
+clusterPodCIDR: ""
+nodeCIDR: ""
+
+replicaCount: 1
+
+# image.repository/tag default to Task 1's IMG split on the colon
+# (per-user-container-operator:dev). Both binaries -- controller and router
+# -- are one image selected by cmd/main.go's first argv subcommand, so
+# RELATED_IMAGE_ROUTER on the controller Deployment is rendered from this
+# SAME repository/tag pair, never a second image reference.
+image:
+  repository: per-user-container-operator
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# metrics.{enabled,port,serviceMonitor.{enabled,labels,interval}} is the
+# exact value shape spec 497-498 names. metrics.port also drives the
+# controller's --metrics-addr flag, its container port, and the metrics
+# Service's port/targetPort -- all four from this one value, never the bare
+# v1alpha1.MetricsPort constant, so an operator who overrides the port gets a
+# Service that still targets a live listener.
+metrics:
+  enabled: true
+  port: 9090
+  serviceMonitor:
+    enabled: true
+    labels: {}
+    interval: 30s
