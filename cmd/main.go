@@ -3,11 +3,26 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
 	"github.com/kettleofketchup/per-user-container-operator/internal/identity"
+	"github.com/kettleofketchup/per-user-container-operator/internal/metrics"
+	"github.com/kettleofketchup/per-user-container-operator/internal/router"
 )
 
 func run(argv []string) error {
@@ -15,9 +30,11 @@ func run(argv []string) error {
 		return errors.New("usage: per-user-container-operator <controller|router|userkey>")
 	}
 	switch argv[1] {
-	// controller wired in Task 11, router in Task 10.
-	case "controller", "router":
+	// controller wired in Task 11.
+	case "controller":
 		return nil
+	case "router":
+		return runRouter(argv[2:])
 	case "userkey":
 		if len(argv) != 5 {
 			return errors.New("usage: per-user-container-operator userkey <namespace> <appName> <rawIdentity>")
@@ -27,6 +44,138 @@ func run(argv []string) error {
 	default:
 		return fmt.Errorf("unknown subcommand %q", argv[1])
 	}
+}
+
+// parseRouterFlags parses the router's ENTIRE startup contract (see
+// task-10-brief.md): the router never reads its own PerUserApp, so every
+// value it needs arrives as a flag rendered onto the Deployment by the
+// controller. --listen-addr and --metrics-addr default to the two shared
+// port constants (v1alpha1.RouterPort / MetricsPort) that Task 5's
+// NetworkPolicy and Task 11's Deployment/Service rendering also use, so all
+// three consumers agree on one number without any of them inventing it.
+// The three --upstream-auth-* flags are conditional: they are simply absent
+// from argv when spec.workspace.upstreamAuth is unset on the PerUserApp,
+// and this function must accept that absence rather than requiring them.
+func parseRouterFlags(args []string) (router.Config, error) {
+	fs := flag.NewFlagSet("router", flag.ContinueOnError)
+
+	app := fs.String("app", "", "PerUserApp name this router serves")
+	namespace := fs.String("namespace", "", "namespace this router serves")
+	identityHeader := fs.String("identity-header", "", "header carrying the caller's raw identity")
+	identityMaxLength := fs.Int("identity-max-length", 256, "maximum accepted length of the identity header value")
+	callerAuthHeader := fs.String("caller-auth-header", "", "header carrying the caller's credential")
+	callerAuthScheme := fs.String("caller-auth-scheme", "", "scheme prefix for the caller-auth header value (e.g. Bearer)")
+	callerAuthSecretFile := fs.String("caller-auth-secret-file", "", "path to the mounted caller-auth secret value")
+	upstreamAuthHeader := fs.String("upstream-auth-header", "", "header the router presents the workspace, if any")
+	upstreamAuthScheme := fs.String("upstream-auth-scheme", "", "scheme prefix for the upstream-auth header value")
+	upstreamAuthSecretFile := fs.String("upstream-auth-secret-file", "", "path to the mounted upstream-auth secret value, if any")
+	workspacePort := fs.Int("workspace-port", 0, "port the workspace container listens on")
+	coldStartHold := fs.Duration("cold-start-hold", 0, "how long to hold a request for a workspace to become servable")
+	connectionHeartbeat := fs.Duration("connection-heartbeat", 0, "how often this replica refreshes its status.connections heartbeat")
+	maxWorkspaces := fs.Int("max-workspaces", 0, "spec.limits.maxWorkspaces, mirrored as a flag since the router holds no peruserapps grant")
+	listenAddr := fs.String("listen-addr", fmt.Sprintf(":%d", v1alpha1.RouterPort), "address the proxy listens on")
+	metricsAddr := fs.String("metrics-addr", fmt.Sprintf(":%d", v1alpha1.MetricsPort), "address metrics are served on")
+
+	if err := fs.Parse(args); err != nil {
+		return router.Config{}, err
+	}
+
+	if *app == "" || *namespace == "" {
+		return router.Config{}, errors.New("--app and --namespace are required")
+	}
+	if *identityHeader == "" {
+		return router.Config{}, errors.New("--identity-header is required")
+	}
+	if *callerAuthHeader == "" || *callerAuthSecretFile == "" {
+		return router.Config{}, errors.New("--caller-auth-header and --caller-auth-secret-file are required: callerAuth is mandatory, never optional")
+	}
+
+	callerSecret, err := router.ReadSecretFile(*callerAuthSecretFile)
+	if err != nil {
+		return router.Config{}, fmt.Errorf("read caller-auth secret file: %w", err)
+	}
+
+	cfg := router.Config{
+		App:                         *app,
+		Namespace:                   *namespace,
+		IdentityHeader:              *identityHeader,
+		IdentityMaxLength:           *identityMaxLength,
+		CallerAuthHeader:            *callerAuthHeader,
+		CallerAuthScheme:            *callerAuthScheme,
+		CallerAuthSecret:            callerSecret,
+		WorkspacePort:               int32(*workspacePort),
+		ColdStartHold:               *coldStartHold,
+		ConnectionHeartbeatInterval: *connectionHeartbeat,
+		MaxWorkspaces:               int32(*maxWorkspaces),
+		PodName:                     os.Getenv("POD_NAME"),
+		ListenAddr:                  *listenAddr,
+		MetricsAddr:                 *metricsAddr,
+	}
+
+	// upstreamAuth is optional and the absent case is a branch, not an
+	// oversight (task-10-brief.md): Task 11 renders neither the secret
+	// volume nor these three flags when spec.workspace.upstreamAuth is
+	// unset, and the router must set no upstream credential while still
+	// performing the strip.
+	if *upstreamAuthHeader != "" {
+		if *upstreamAuthSecretFile == "" {
+			return router.Config{}, errors.New("--upstream-auth-header given without --upstream-auth-secret-file")
+		}
+		upstreamSecret, err := router.ReadSecretFile(*upstreamAuthSecretFile)
+		if err != nil {
+			return router.Config{}, fmt.Errorf("read upstream-auth secret file: %w", err)
+		}
+		cfg.UpstreamAuthHeader = *upstreamAuthHeader
+		cfg.UpstreamAuthScheme = *upstreamAuthScheme
+		cfg.UpstreamAuthSecret = upstreamSecret
+	}
+
+	return cfg, nil
+}
+
+// runRouter builds a client from the mounted <app>-router ServiceAccount
+// token (rest.InClusterConfig — this binary runs no manager, so it does not
+// go through controller-runtime's manager/cache setup) and serves the proxy
+// on --listen-addr and metrics on --metrics-addr, per Task 7's shared
+// registry (promhttp.HandlerFor(metrics.Gatherer(), ...)) rather than
+// standing up its own manager or registry.
+func runRouter(args []string) error {
+	cfg, err := parseRouterFlags(args)
+	if err != nil {
+		return err
+	}
+
+	restCfg, err := rest.InClusterConfig()
+	if err != nil {
+		return fmt.Errorf("in-cluster config: %w", err)
+	}
+
+	scheme := runtime.NewScheme()
+	utilruntime.Must(corev1.AddToScheme(scheme))
+	utilruntime.Must(discoveryv1.AddToScheme(scheme))
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+
+	c, err := client.NewWithWatch(restCfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return fmt.Errorf("new client: %w", err)
+	}
+
+	srv := router.NewServer(cfg, c)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go srv.Conns.Run(ctx)
+	go func() { _ = srv.Resolver.WatchServiceDeletes(ctx, c, cfg.Namespace) }()
+	go func() { _ = srv.Resolver.WatchWorkspaceDeletes(ctx, c, cfg.Namespace) }()
+
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.HandlerFor(metrics.Gatherer(), promhttp.HandlerOpts{}))
+	metricsServer := &http.Server{Addr: cfg.MetricsAddr, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { _ = metricsServer.ListenAndServe() }()
+
+	proxyServer := &http.Server{Addr: cfg.ListenAddr, Handler: srv, ReadHeaderTimeout: 5 * time.Second}
+	return proxyServer.ListenAndServe()
 }
 
 func main() {
