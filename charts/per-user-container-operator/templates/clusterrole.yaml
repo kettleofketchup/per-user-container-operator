@@ -1,9 +1,13 @@
 {{/*
-The ONE ClusterRole this chart renders, covering exactly three things: the
-two CustomResourceDefinition objects (apiextensions.k8s.io is cluster-scoped
-even though PerUserApp/Workspace themselves are namespaced -- the CRs
-themselves are granted by the per-namespace Role in role.yaml), leader
-election Leases, and storageclasses.
+The ONE ClusterRole this chart renders, covering leader election Leases and
+storageclasses -- both genuinely cluster-scoped. It deliberately does NOT
+grant apiextensions.k8s.io/customresourcedefinitions: no Go code path in
+this operator reads CustomResourceDefinition objects and no
++kubebuilder:rbac marker anywhere names that group, so a grant here would
+be unjustified privilege in a chart whose whole point is least-privilege.
+PerUserApp/Workspace themselves are namespaced custom resources, not
+cluster-scoped CRD meta-objects, and are already fully granted by the
+per-namespace Role in role.yaml.
 
 storage.k8s.io/storageclasses is NOT in the spec's RBAC list (spec 556 says
 "Nothing else is cluster-scoped") -- that line is a SPEC DEFECT, recorded
@@ -25,9 +29,6 @@ metadata:
   labels:
     {{- include "puc.controllerPodLabels" . | nindent 4 }}
 rules:
-  - apiGroups: ["apiextensions.k8s.io"]
-    resources: ["customresourcedefinitions"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

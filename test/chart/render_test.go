@@ -385,7 +385,7 @@ func TestClusterRoleBindingBindsServiceAccountToClusterRole(t *testing.T) {
 	}
 }
 
-func TestClusterRoleCoversCRDsLeaderElectionAndStorageClasses(t *testing.T) {
+func TestClusterRoleCoversLeaderElectionAndStorageClassesOnly(t *testing.T) {
 	set := decodeRendered(t, helmTemplate(t, defaultOpts()))
 	if len(set.clusterRoles) != 1 {
 		t.Fatalf("want exactly 1 ClusterRole, got %d", len(set.clusterRoles))
@@ -411,14 +411,24 @@ func TestClusterRoleCoversCRDsLeaderElectionAndStorageClasses(t *testing.T) {
 	if ruleVerbs(rules, "coordination.k8s.io", "leases") == nil {
 		t.Error("ClusterRole has no rule for coordination.k8s.io/leases (leader election)")
 	}
-	if ruleVerbs(rules, "apiextensions.k8s.io", "customresourcedefinitions") == nil {
-		t.Error("ClusterRole has no rule for apiextensions.k8s.io/customresourcedefinitions (the two CRDs)")
+
+	// apiextensions.k8s.io/customresourcedefinitions is deliberately ABSENT:
+	// no Go code path in this operator reads CustomResourceDefinition
+	// objects and no +kubebuilder:rbac marker anywhere names that group.
+	// Every other grant in this chart traces to a marker or a documented
+	// spec defect (storageclasses above); this one would trace to nothing,
+	// i.e. unjustified privilege in a chart whose whole point is
+	// least-privilege. Asserted as a negative so a future re-addition needs
+	// a deliberate edit here, not a silent drift back in.
+	if ruleVerbs(rules, "apiextensions.k8s.io", "customresourcedefinitions") != nil {
+		t.Error("ClusterRole grants apiextensions.k8s.io/customresourcedefinitions, but nothing in this operator reads CRD objects and no RBAC marker names that group -- remove it, or add a comment naming the concrete code path that needs it")
 	}
 
-	// Confirm this grant is NOT duplicated onto any per-namespace Role: that
-	// would be the natural-looking move the carry-forward note calls out as
-	// silently wrong (a namespaced Role can never authorize a cluster-scoped
-	// request, but nothing raises an error when you write one anyway).
+	// Confirm the storageclasses grant is NOT duplicated onto any
+	// per-namespace Role: that would be the natural-looking move the
+	// carry-forward note calls out as silently wrong (a namespaced Role can
+	// never authorize a cluster-scoped request, but nothing raises an error
+	// when you write one anyway).
 	for _, r := range set.roles {
 		if ruleVerbs(r.Rules, "storage.k8s.io", "storageclasses") != nil {
 			t.Errorf("namespaced Role %s/%s grants storage.k8s.io/storageclasses -- this must live ONLY on the ClusterRole; a namespaced grant on a cluster-scoped resource silently fails at authorization time even though SelfSubjectAccessReview says Allowed", r.Namespace, r.Name)
