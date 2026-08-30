@@ -6,13 +6,16 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -36,6 +39,25 @@ const (
 	workspaceContainerName = "workspace"
 	workspacePortName      = "http"
 	seedContainerName      = "seed"
+
+	// routerContainerName is the rendered router container and its declared
+	// HTTP port name; routerMetricsPortName names its second declared port.
+	routerContainerName   = "router"
+	routerPortName        = "http"
+	routerMetricsPortName = "metrics"
+
+	// callerAuthVolumeName/upstreamAuthVolumeName/*MountPath are the FIXED
+	// locations task-10-brief.md's --caller-auth-secret-file and
+	// --upstream-auth-secret-file flags name. secretItemPath is the fixed
+	// filename every projected credential volume uses regardless of its
+	// Secret key: a plain Secret volume otherwise names each file after its
+	// key, and the fixture/consumer key "api-key" would put the file at
+	// .../caller-auth/api-key instead of the path the router is told to read.
+	callerAuthVolumeName   = "caller-auth"
+	callerAuthMountPath    = "/etc/puc/caller-auth"
+	upstreamAuthVolumeName = "upstream-auth"
+	upstreamAuthMountPath  = "/etc/puc/upstream-auth"
+	secretItemPath         = "value"
 )
 
 // RouterPodLabels is the single source of the labels a router pod carries
@@ -403,6 +425,208 @@ func RenderRouterNetworkPolicy(app *v1alpha1.PerUserApp, podCIDR, nodeCIDR strin
 				{To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: podCIDR}}}},
 			},
 		},
+	}
+}
+
+// secretRefVolume renders a Secret volume that projects ref's key onto the
+// fixed filename secretItemPath, regardless of what ref.Key actually is: a
+// plain Secret volume otherwise names each projected file after its key, so
+// key "api-key" (the value in every fixture and both consumer CRs) would put
+// the file at .../api-key instead of the path the router's
+// --caller-auth-secret-file / --upstream-auth-secret-file flags name.
+func secretRefVolume(name string, ref corev1.SecretKeySelector) corev1.Volume {
+	return corev1.Volume{
+		Name: name,
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: ref.Name,
+				Items:      []corev1.KeyToPath{{Key: ref.Key, Path: secretItemPath}},
+			},
+		},
+	}
+}
+
+// routerServiceAccountName and routerName return the shared identity/child
+// names other renderers and the reconciler must agree on byte-for-byte.
+func routerServiceAccountName(app *v1alpha1.PerUserApp) string { return app.Name + "-router" }
+func routerName(app *v1alpha1.PerUserApp) string               { return app.Name + "-router" }
+func workspaceServiceAccountName(app *v1alpha1.PerUserApp) string {
+	return app.Name + "-workspace"
+}
+
+// RenderRouterDeployment renders the shared router Deployment for app: one
+// container running exactly Task 10's startup contract as Args, the
+// caller-auth credential mounted unconditionally, the upstream-auth
+// credential mounted only when spec.workspace.upstreamAuth is set, and
+// POD_NAME from the downward API (in the startup contract but not a flag, so
+// the flag-list assertion alone cannot see its absence).
+//
+// routerImage is the RELATED_IMAGE_ROUTER value the controller entrypoint
+// resolved and fail-fast-checked at startup; spec.router.Image overrides it
+// when set (a development escape hatch only). If both are empty this
+// returns an error rather than rendering a Deployment with an empty image:
+// the API server accepts an empty image string, and the resulting Deployment
+// simply never becomes ready -- diagnosed at 3am, not at admission.
+func RenderRouterDeployment(app *v1alpha1.PerUserApp, routerImage string) (*appsv1.Deployment, error) {
+	image := app.Spec.Router.Image
+	if image == "" {
+		image = routerImage
+	}
+	if image == "" {
+		return nil, errors.New("router image unresolved: RELATED_IMAGE_ROUTER must be set on the controller, or spec.router.image set for development")
+	}
+
+	labels := RouterPodLabels(app.Name)
+	name := routerName(app)
+	saName := routerServiceAccountName(app)
+
+	args := []string{
+		"router",
+		"--app=" + app.Name,
+		"--namespace=" + app.Namespace,
+		"--identity-header=" + app.Spec.Identity.Header,
+		fmt.Sprintf("--identity-max-length=%d", app.Spec.Identity.MaxLength),
+		"--caller-auth-header=" + app.Spec.CallerAuth.Header,
+	}
+	if app.Spec.CallerAuth.Scheme != "" {
+		args = append(args, "--caller-auth-scheme="+app.Spec.CallerAuth.Scheme)
+	}
+	args = append(args,
+		"--caller-auth-secret-file="+callerAuthMountPath+"/"+secretItemPath,
+		fmt.Sprintf("--workspace-port=%d", app.Spec.Workspace.Port),
+		"--cold-start-hold="+(time.Duration(app.Spec.Router.ColdStartHoldSeconds)*time.Second).String(),
+		"--connection-heartbeat="+app.Spec.Lifecycle.ConnectionHeartbeatInterval.Duration.String(),
+		fmt.Sprintf("--max-workspaces=%d", app.Spec.Limits.MaxWorkspaces),
+		fmt.Sprintf("--listen-addr=:%d", v1alpha1.RouterPort),
+		fmt.Sprintf("--metrics-addr=:%d", v1alpha1.MetricsPort),
+	)
+
+	volumes := []corev1.Volume{secretRefVolume(callerAuthVolumeName, app.Spec.CallerAuth.SecretRef)}
+	mounts := []corev1.VolumeMount{{Name: callerAuthVolumeName, MountPath: callerAuthMountPath, ReadOnly: true}}
+
+	if ua := app.Spec.Workspace.UpstreamAuth; ua != nil {
+		args = append(args, "--upstream-auth-header="+ua.Header)
+		if ua.Scheme != "" {
+			args = append(args, "--upstream-auth-scheme="+ua.Scheme)
+		}
+		args = append(args, "--upstream-auth-secret-file="+upstreamAuthMountPath+"/"+secretItemPath)
+		volumes = append(volumes, secretRefVolume(upstreamAuthVolumeName, ua.SecretRef))
+		mounts = append(mounts, corev1.VolumeMount{Name: upstreamAuthVolumeName, MountPath: upstreamAuthMountPath, ReadOnly: true})
+	}
+
+	replicas := app.Spec.Router.Replicas
+
+	container := corev1.Container{
+		Name:  routerContainerName,
+		Image: image,
+		Args:  args,
+		Env: []corev1.EnvVar{{
+			Name:      "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+		}},
+		Ports: []corev1.ContainerPort{
+			{Name: routerPortName, ContainerPort: v1alpha1.RouterPort},
+			{Name: routerMetricsPortName, ContainerPort: v1alpha1.MetricsPort},
+		},
+		Resources:    app.Spec.Router.Resources,
+		VolumeMounts: mounts,
+	}
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       app.Namespace,
+			Labels:          labels,
+			OwnerReferences: []metav1.OwnerReference{appOwnerRef(app)},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: saName,
+					Containers:         []corev1.Container{container},
+					Volumes:            volumes,
+				},
+			},
+		},
+	}, nil
+}
+
+// RenderRouterService renders the ClusterIP Service fronting an app's router
+// pods, on RouterPort (proxy traffic) and MetricsPort (Prometheus scrape) --
+// both the shared constants, never re-typed numbers, so this Service, the
+// Deployment's container ports and RenderRouterNetworkPolicy's ingress rule
+// cannot silently drift onto different numbers.
+func RenderRouterService(app *v1alpha1.PerUserApp) *corev1.Service {
+	labels := RouterPodLabels(app.Name)
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            routerName(app),
+			Namespace:       app.Namespace,
+			Labels:          labels,
+			OwnerReferences: []metav1.OwnerReference{appOwnerRef(app)},
+		},
+		Spec: corev1.ServiceSpec{
+			Type:     corev1.ServiceTypeClusterIP,
+			Selector: labels,
+			Ports: []corev1.ServicePort{
+				{Name: routerPortName, Port: v1alpha1.RouterPort, TargetPort: intstr.FromInt32(v1alpha1.RouterPort)},
+				{Name: routerMetricsPortName, Port: v1alpha1.MetricsPort, TargetPort: intstr.FromInt32(v1alpha1.MetricsPort)},
+			},
+		},
+	}
+}
+
+// RenderWorkspaceServiceAccount renders the <app>-workspace ServiceAccount:
+// the default RenderWorkspaceDeployment assigns every user's workspace pod.
+// Deliberately never bound to a RoleBinding by anything in this package: the
+// operator's own ServiceAccount can create pods and read PersistentVolumeClaims
+// across every served namespace, and that grant inside a user's workspace is
+// `kubectl create pod` with someone else's claimName.
+func RenderWorkspaceServiceAccount(app *v1alpha1.PerUserApp) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            workspaceServiceAccountName(app),
+			Namespace:       app.Namespace,
+			Labels:          map[string]string{v1alpha1.LabelApp: app.Name, v1alpha1.LabelPartOf: v1alpha1.PartOfValue},
+			OwnerReferences: []metav1.OwnerReference{appOwnerRef(app)},
+		},
+	}
+}
+
+// RenderRouterServiceAccount renders the <app>-router ServiceAccount the
+// router Deployment runs as.
+func RenderRouterServiceAccount(app *v1alpha1.PerUserApp) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            routerServiceAccountName(app),
+			Namespace:       app.Namespace,
+			Labels:          RouterPodLabels(app.Name),
+			OwnerReferences: []metav1.OwnerReference{appOwnerRef(app)},
+		},
+	}
+}
+
+// RenderRouterRoleBinding renders the RoleBinding naming the <app>-router
+// ServiceAccount against v1alpha1.RouterRoleName -- the per-namespace Role
+// Task 12's chart renders. This package renders only the binding, never the
+// Role's rules: a RoleBinding may name a Role that does not exist yet with
+// no error at creation time (RBAC is enforced at authorization time, not
+// admission), and asserting "rules are exactly ..." belongs to Task 12,
+// where the Role is the artifact under test.
+func RenderRouterRoleBinding(app *v1alpha1.PerUserApp) *rbacv1.RoleBinding {
+	saName := routerServiceAccountName(app)
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            routerName(app),
+			Namespace:       app.Namespace,
+			Labels:          RouterPodLabels(app.Name),
+			OwnerReferences: []metav1.OwnerReference{appOwnerRef(app)},
+		},
+		Subjects: []rbacv1.Subject{{Kind: "ServiceAccount", Name: saName, Namespace: app.Namespace}},
+		RoleRef:  rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: v1alpha1.RouterRoleName},
 	}
 }
 
