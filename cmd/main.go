@@ -39,9 +39,8 @@ func run(argv []string) error {
 		return errors.New("usage: per-user-container-operator <controller|router|userkey>")
 	}
 	switch argv[1] {
-	// controller wired in Task 11.
 	case "controller":
-		return nil
+		return runController(argv[2:])
 	case "router":
 		return runRouter(argv[2:])
 	case "userkey":

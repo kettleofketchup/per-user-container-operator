@@ -201,7 +201,7 @@ func TestProbeNamespaceOneDeniedIsNotReady(t *testing.T) {
 	fc := newFakeClientsetForProbe(selfSARReactor(func(res authorizationv1.ResourceAttributes) bool {
 		// Deny exactly the grant the router's identity create depends on;
 		// everything else allowed.
-		return !(res.Resource == "workspaces" && res.Verb == "create")
+		return res.Resource != "workspaces" || res.Verb != "create"
 	}))
 	ok, failed := probeNamespace(context.Background(), fc.AuthorizationV1(), "ns1")
 	if ok || len(failed) == 0 {
