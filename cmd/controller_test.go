@@ -2,6 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,5 +212,163 @@ func TestProbeNamespaceOneDeniedIsNotReady(t *testing.T) {
 	ok, failed := probeNamespace(context.Background(), fc.AuthorizationV1(), "ns1")
 	if ok || len(failed) == 0 {
 		t.Fatalf("probeNamespace = ok=%v failed=%v, want ok=false with at least one failure", ok, failed)
+	}
+}
+
+// namespacedRoleOnlyReactor simulates the exact shape Finding 1 named: a
+// namespaced Role granting `verb` on storageclasses answers Allowed:true
+// for a SelfSubjectAccessReview that carries a Namespace, regardless of
+// hasClusterRoleGrant -- only a SAR with NO Namespace asks the question the
+// real cluster-scoped client.Get() actually makes, and only that shape is
+// gated on hasClusterRoleGrant. Every other (namespaced) resource is always
+// allowed, so a test using this reactor isolates the storageclasses
+// decision as the sole variable.
+//
+// It fails the test outright the moment probeNamespace issues a NAMESPACED
+// SAR for storageclasses: that is the bug itself, not a value this reactor
+// should silently score as denied.
+func namespacedRoleOnlyReactor(t *testing.T, hasClusterRoleGrant bool) clienttesting.ReactionFunc {
+	return func(action clienttesting.Action) (bool, runtime.Object, error) {
+		ca, ok := action.(clienttesting.CreateAction)
+		if !ok {
+			return false, nil, nil
+		}
+		review, ok := ca.GetObject().(*authorizationv1.SelfSubjectAccessReview)
+		if !ok || review.Spec.ResourceAttributes == nil {
+			return false, nil, nil
+		}
+		attrs := review.Spec.ResourceAttributes
+		out := review.DeepCopy()
+		if attrs.Resource == "storageclasses" {
+			if attrs.Namespace != "" {
+				t.Fatalf("probeNamespace issued a NAMESPACED SelfSubjectAccessReview (namespace=%q) for cluster-scoped resource %q; the real client.Get() against a cluster-scoped object is never namespaced, so this SAR asks an easier question than the request ValidateStorageClass actually makes", attrs.Namespace, attrs.Resource)
+			}
+			out.Status.Allowed = hasClusterRoleGrant
+			return true, out, nil
+		}
+		out.Status.Allowed = true
+		return true, out, nil
+	}
+}
+
+// TestProbeNamespaceUsesClusterScopeCorrectlyForStorageClasses is Finding
+// 1's proof: constructed first against the namespaced-Role-only case (no
+// ClusterRole at all), then against a proper ClusterRole grant.
+func TestProbeNamespaceUsesClusterScopeCorrectlyForStorageClasses(t *testing.T) {
+	t.Run("namespaced Role only: probe reports NOT ready", func(t *testing.T) {
+		fc := newFakeClientsetForProbe(namespacedRoleOnlyReactor(t, false))
+		ok, failed := probeNamespace(context.Background(), fc.AuthorizationV1(), "ns1")
+		if ok {
+			t.Fatalf("probe reported ready with no ClusterRole granting storageclasses; failed=%v", failed)
+		}
+		var namesStorageClasses bool
+		for _, f := range failed {
+			if strings.Contains(f, "storageclasses") {
+				namesStorageClasses = true
+			}
+		}
+		if !namesStorageClasses {
+			t.Fatalf("failed list does not name storageclasses: %v", failed)
+		}
+	})
+
+	t.Run("proper ClusterRole: probe reports ready", func(t *testing.T) {
+		fc := newFakeClientsetForProbe(namespacedRoleOnlyReactor(t, true))
+		ok, failed := probeNamespace(context.Background(), fc.AuthorizationV1(), "ns1")
+		if !ok {
+			t.Fatalf("probe reported not ready with a proper ClusterRole granting storageclasses: failed=%v", failed)
+		}
+	})
+}
+
+// rbacMarkerRe parses one +kubebuilder:rbac:groups=<g>,resources=<r1>;<r2>,verbs=<v1>;<v2>
+// marker line. groups may be a bare word (apps.kettleofketchup) or the
+// literal `""` for the core group.
+var rbacMarkerRe = regexp.MustCompile(`\+kubebuilder:rbac:groups=([^,]*),resources=([^,]+),verbs=(\S+)`)
+
+// markerChecksFromControllerFiles mechanically derives the expected
+// (group, resource, verb) set from every +kubebuilder:rbac marker in
+// internal/controller/*_controller.go, expanding the semicolon-joined
+// resources and verbs lists on each marker line.
+func markerChecksFromControllerFiles(t *testing.T) []namespaceCheck {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join("..", "internal", "controller", "*_controller.go"))
+	if err != nil {
+		t.Fatalf("glob controller files: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no *_controller.go files found; this drift check has nothing to compare against")
+	}
+	var checks []namespaceCheck
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			m := rbacMarkerRe.FindStringSubmatch(line)
+			if m == nil {
+				continue
+			}
+			group := strings.Trim(m[1], `"`)
+			for _, res := range strings.Split(m[2], ";") {
+				for _, verb := range strings.Split(m[3], ";") {
+					checks = append(checks, namespaceCheck{group: group, resource: res, verb: verb})
+				}
+			}
+		}
+	}
+	return checks
+}
+
+func namespaceCheckKey(c namespaceCheck) string {
+	return fmt.Sprintf("%s|%s|%s", c.group, c.resource, c.verb)
+}
+
+// TestProbeNamespaceChecksMatchRBACMarkers is a drift guard in the same
+// shape as internal/metrics/callsite_coverage_test.go: it mechanically
+// derives the expected check set from the +kubebuilder:rbac markers on
+// WorkspaceReconciler and PerUserAppReconciler and asserts set-equality
+// (by group/resource/verb, ignoring clusterScoped) against
+// controllerNamespaceChecks, so a reconciler that gains or loses an RBAC
+// verb cannot silently drift from what the startup probe checks.
+//
+// This catches ONLY hand-maintenance drift between the markers and the
+// check list. It does NOT catch the cluster-scope blind spot Finding 1
+// fixed: a marker and a check can agree perfectly on group/resource/verb
+// while the check still asks the SelfSubjectAccessReview the wrong scope
+// question (namespaced vs. cluster-scoped). Those are two independent
+// failure modes -- passing this test says nothing about whether
+// clusterScoped is set correctly on any entry.
+func TestProbeNamespaceChecksMatchRBACMarkers(t *testing.T) {
+	derived := markerChecksFromControllerFiles(t)
+
+	want := map[string]bool{}
+	for _, c := range derived {
+		want[namespaceCheckKey(c)] = true
+	}
+	got := map[string]bool{}
+	for _, c := range controllerNamespaceChecks {
+		got[namespaceCheckKey(c)] = true
+	}
+
+	var missing, extra []string
+	for k := range want {
+		if !got[k] {
+			missing = append(missing, k)
+		}
+	}
+	for k := range got {
+		if !want[k] {
+			extra = append(extra, k)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	if len(missing) > 0 {
+		t.Errorf("controllerNamespaceChecks is missing entries an RBAC marker grants: %v", missing)
+	}
+	if len(extra) > 0 {
+		t.Errorf("controllerNamespaceChecks probes a verb no RBAC marker grants: %v", extra)
 	}
 }
