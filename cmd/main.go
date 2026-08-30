@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+
+	"github.com/kettleofketchup/per-user-container-operator/internal/identity"
 )
 
 func run(argv []string) error {
@@ -13,11 +15,14 @@ func run(argv []string) error {
 		return errors.New("usage: per-user-container-operator <controller|router|userkey>")
 	}
 	switch argv[1] {
-	// controller wired in Task 11, router in Task 10, userkey in Task 3.
-	// userkey exists so the migration Job (Task 16) never reimplements the
-	// frozen derivation in a script: two implementations is total silent data
-	// loss.
-	case "controller", "router", "userkey":
+	// controller wired in Task 11, router in Task 10.
+	case "controller", "router":
+		return nil
+	case "userkey":
+		if len(argv) != 5 {
+			return errors.New("usage: per-user-container-operator userkey <namespace> <appName> <rawIdentity>")
+		}
+		fmt.Println(identity.UserKey(argv[2], argv[3], argv[4]))
 		return nil
 	default:
 		return fmt.Errorf("unknown subcommand %q", argv[1])
