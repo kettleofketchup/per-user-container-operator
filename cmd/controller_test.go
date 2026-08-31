@@ -15,6 +15,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+
+	"github.com/kettleofketchup/per-user-container-operator/internal/rbacspec"
 )
 
 func TestParseControllerFlagsRequiresWatchNamespaces(t *testing.T) {
@@ -290,7 +292,7 @@ var rbacMarkerRe = regexp.MustCompile(`\+kubebuilder:rbac:groups=([^,]*),resourc
 // (group, resource, verb) set from every +kubebuilder:rbac marker in
 // internal/controller/*_controller.go, expanding the semicolon-joined
 // resources and verbs lists on each marker line.
-func markerChecksFromControllerFiles(t *testing.T) []namespaceCheck {
+func markerChecksFromControllerFiles(t *testing.T) []rbacspec.NamespaceCheck {
 	t.Helper()
 	files, err := filepath.Glob(filepath.Join("..", "internal", "controller", "*_controller.go"))
 	if err != nil {
@@ -299,7 +301,7 @@ func markerChecksFromControllerFiles(t *testing.T) []namespaceCheck {
 	if len(files) == 0 {
 		t.Fatal("no *_controller.go files found; this drift check has nothing to compare against")
 	}
-	var checks []namespaceCheck
+	var checks []rbacspec.NamespaceCheck
 	for _, f := range files {
 		b, err := os.ReadFile(f)
 		if err != nil {
@@ -313,7 +315,7 @@ func markerChecksFromControllerFiles(t *testing.T) []namespaceCheck {
 			group := strings.Trim(m[1], `"`)
 			for _, res := range strings.Split(m[2], ";") {
 				for _, verb := range strings.Split(m[3], ";") {
-					checks = append(checks, namespaceCheck{group: group, resource: res, verb: verb})
+					checks = append(checks, rbacspec.NamespaceCheck{Group: group, Resource: res, Verb: verb})
 				}
 			}
 		}
@@ -321,17 +323,17 @@ func markerChecksFromControllerFiles(t *testing.T) []namespaceCheck {
 	return checks
 }
 
-func namespaceCheckKey(c namespaceCheck) string {
-	return fmt.Sprintf("%s|%s|%s", c.group, c.resource, c.verb)
+func namespaceCheckKey(c rbacspec.NamespaceCheck) string {
+	return fmt.Sprintf("%s|%s|%s", c.Group, c.Resource, c.Verb)
 }
 
 // TestProbeNamespaceChecksMatchRBACMarkers is a drift guard in the same
 // shape as internal/metrics/callsite_coverage_test.go: it mechanically
 // derives the expected check set from the +kubebuilder:rbac markers on
 // WorkspaceReconciler and PerUserAppReconciler and asserts set-equality
-// (by group/resource/verb, ignoring clusterScoped) against
-// controllerNamespaceChecks, so a reconciler that gains or loses an RBAC
-// verb cannot silently drift from what the startup probe checks.
+// (by group/resource/verb, ignoring ClusterScoped) against
+// rbacspec.ControllerNamespaceChecks, so a reconciler that gains or loses
+// an RBAC verb cannot silently drift from what the startup probe checks.
 //
 // This catches ONLY hand-maintenance drift between the markers and the
 // check list. It does NOT catch the cluster-scope blind spot Finding 1
@@ -348,7 +350,7 @@ func TestProbeNamespaceChecksMatchRBACMarkers(t *testing.T) {
 		want[namespaceCheckKey(c)] = true
 	}
 	got := map[string]bool{}
-	for _, c := range controllerNamespaceChecks {
+	for _, c := range rbacspec.ControllerNamespaceChecks {
 		got[namespaceCheckKey(c)] = true
 	}
 
@@ -366,9 +368,9 @@ func TestProbeNamespaceChecksMatchRBACMarkers(t *testing.T) {
 	sort.Strings(missing)
 	sort.Strings(extra)
 	if len(missing) > 0 {
-		t.Errorf("controllerNamespaceChecks is missing entries an RBAC marker grants: %v", missing)
+		t.Errorf("rbacspec.ControllerNamespaceChecks is missing entries an RBAC marker grants: %v", missing)
 	}
 	if len(extra) > 0 {
-		t.Errorf("controllerNamespaceChecks probes a verb no RBAC marker grants: %v", extra)
+		t.Errorf("rbacspec.ControllerNamespaceChecks probes a verb no RBAC marker grants: %v", extra)
 	}
 }

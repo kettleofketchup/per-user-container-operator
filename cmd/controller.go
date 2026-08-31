@@ -26,6 +26,7 @@ import (
 	"github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
 	"github.com/kettleofketchup/per-user-container-operator/internal/controller"
 	"github.com/kettleofketchup/per-user-container-operator/internal/metrics"
+	"github.com/kettleofketchup/per-user-container-operator/internal/rbacspec"
 )
 
 // leaderElectionID names both the Lease controller-runtime's leader elector
@@ -180,95 +181,6 @@ func computeLeaderless(now time.Time, snap leaseSnapshot, podName string) time.D
 	return now.Sub(snap.renewTime)
 }
 
-// namespaceCheck is one (group, resource, verb) the startup verb probe
-// attempts in a served namespace.
-//
-// clusterScoped marks a resource that is NOT namespaced (storageclasses is
-// the only one today). This field exists specifically so a cluster-scoped
-// addition is a deliberate, visible choice at the call site, not a string
-// some future reader has to recognize by name: a SelfSubjectAccessReview
-// evaluates exactly the hypothetical it is handed, and a NAMESPACED Role
-// granting a verb on a cluster-scoped resource answers Allowed:true for a
-// namespaced SAR even though the real client.Get() against that
-// cluster-scoped object is Forbidden -- passing a namespace asks an easier
-// question than the request the controller actually makes. See
-// probeNamespace's doc comment for how this field changes the SAR sent.
-type namespaceCheck struct {
-	group, resource, verb string
-	clusterScoped         bool
-}
-
-// controllerNamespaceChecks mirrors every +kubebuilder:rbac marker across
-// WorkspaceReconciler and PerUserAppReconciler: the verbs each actually
-// uses, per resource. Every entry here is namespaced EXCEPT the three
-// storageclasses checks, marked clusterScoped: true -- storage.k8s.io
-// StorageClass is spec 556's one stated exception to "nothing else is
-// cluster-scoped," and Task 12's chart grants it via a ClusterRole rather
-// than the per-namespace Role this list otherwise probes.
-var controllerNamespaceChecks = []namespaceCheck{
-	{group: v1alpha1.GroupVersion.Group, resource: "peruserapps", verb: "get"},
-	{group: v1alpha1.GroupVersion.Group, resource: "peruserapps", verb: "list"},
-	{group: v1alpha1.GroupVersion.Group, resource: "peruserapps", verb: "watch"},
-	{group: v1alpha1.GroupVersion.Group, resource: "peruserapps/status", verb: "get"},
-	{group: v1alpha1.GroupVersion.Group, resource: "peruserapps/status", verb: "update"},
-	{group: v1alpha1.GroupVersion.Group, resource: "peruserapps/status", verb: "patch"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces", verb: "get"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces", verb: "list"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces", verb: "watch"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces", verb: "create"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces", verb: "update"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces", verb: "patch"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces", verb: "delete"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces/status", verb: "get"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces/status", verb: "update"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces/status", verb: "patch"},
-	{group: v1alpha1.GroupVersion.Group, resource: "workspaces/finalizers", verb: "update"},
-	{group: "apps", resource: "deployments", verb: "get"},
-	{group: "apps", resource: "deployments", verb: "list"},
-	{group: "apps", resource: "deployments", verb: "watch"},
-	{group: "apps", resource: "deployments", verb: "create"},
-	{group: "apps", resource: "deployments", verb: "update"},
-	{group: "apps", resource: "deployments", verb: "patch"},
-	{group: "", resource: "services", verb: "get"},
-	{group: "", resource: "services", verb: "list"},
-	{group: "", resource: "services", verb: "watch"},
-	{group: "", resource: "services", verb: "create"},
-	{group: "", resource: "services", verb: "update"},
-	{group: "", resource: "services", verb: "patch"},
-	{group: "", resource: "persistentvolumeclaims", verb: "get"},
-	{group: "", resource: "persistentvolumeclaims", verb: "list"},
-	{group: "", resource: "persistentvolumeclaims", verb: "watch"},
-	{group: "", resource: "persistentvolumeclaims", verb: "create"},
-	{group: "", resource: "persistentvolumeclaims", verb: "update"},
-	{group: "", resource: "persistentvolumeclaims", verb: "patch"},
-	{group: "", resource: "pods", verb: "get"},
-	{group: "", resource: "pods", verb: "list"},
-	{group: "", resource: "pods", verb: "watch"},
-	{group: "", resource: "serviceaccounts", verb: "get"},
-	{group: "", resource: "serviceaccounts", verb: "list"},
-	{group: "", resource: "serviceaccounts", verb: "watch"},
-	{group: "", resource: "serviceaccounts", verb: "create"},
-	{group: "", resource: "serviceaccounts", verb: "update"},
-	{group: "", resource: "serviceaccounts", verb: "patch"},
-	{group: "", resource: "events", verb: "create"},
-	{group: "", resource: "events", verb: "patch"},
-	{group: "networking.k8s.io", resource: "networkpolicies", verb: "get"},
-	{group: "networking.k8s.io", resource: "networkpolicies", verb: "list"},
-	{group: "networking.k8s.io", resource: "networkpolicies", verb: "watch"},
-	{group: "networking.k8s.io", resource: "networkpolicies", verb: "create"},
-	{group: "networking.k8s.io", resource: "networkpolicies", verb: "update"},
-	{group: "networking.k8s.io", resource: "networkpolicies", verb: "patch"},
-	{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "get"},
-	{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "list"},
-	{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "watch"},
-	{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "create"},
-	{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "update"},
-	{group: "rbac.authorization.k8s.io", resource: "rolebindings", verb: "patch"},
-	{group: "storage.k8s.io", resource: "storageclasses", verb: "get", clusterScoped: true},
-	{group: "storage.k8s.io", resource: "storageclasses", verb: "list", clusterScoped: true},
-	{group: "storage.k8s.io", resource: "storageclasses", verb: "watch", clusterScoped: true},
-}
-
 // probeNamespace attempts every verb this controller uses in ns via a
 // SelfSubjectAccessReview per (group, resource, verb), so a missing grant is
 // discovered at startup, in puc_watched_namespace_ready, rather than per
@@ -285,14 +197,14 @@ var controllerNamespaceChecks = []namespaceCheck{
 func probeNamespace(ctx context.Context, authz authorizationv1client.AuthorizationV1Interface, ns string) (bool, []string) {
 	ok := true
 	var failed []string
-	for _, c := range controllerNamespaceChecks {
+	for _, c := range rbacspec.ControllerNamespaceChecks {
 		attrs := &authorizationv1.ResourceAttributes{
-			Group:    c.group,
-			Resource: c.resource,
-			Verb:     c.verb,
+			Group:    c.Group,
+			Resource: c.Resource,
+			Verb:     c.Verb,
 		}
 		scope := ns
-		if !c.clusterScoped {
+		if !c.ClusterScoped {
 			attrs.Namespace = ns
 		} else {
 			scope = "cluster-scoped"
@@ -303,7 +215,7 @@ func probeNamespace(ctx context.Context, authz authorizationv1client.Authorizati
 		result, err := authz.SelfSubjectAccessReviews().Create(ctx, review, metav1.CreateOptions{})
 		if err != nil || !result.Status.Allowed {
 			ok = false
-			failed = append(failed, fmt.Sprintf("%s/%s %s (%s)", c.group, c.resource, c.verb, scope))
+			failed = append(failed, fmt.Sprintf("%s/%s %s (%s)", c.Group, c.Resource, c.Verb, scope))
 		}
 	}
 	return ok, failed

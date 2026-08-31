@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
+	"github.com/kettleofketchup/per-user-container-operator/internal/rbacspec"
 )
 
 // chartPath resolves the chart directory relative to this test file, not the
@@ -500,6 +501,89 @@ func TestControllerRolePerNamespace(t *testing.T) {
 		}
 		if !boundSA {
 			t.Errorf("RoleBinding %s/%s does not bind ServiceAccount %s/%s", ns, rb.Name, opts.releaseNS, v1alpha1.OperatorServiceAccountName)
+		}
+	}
+}
+
+// TestChartRoleAndClusterRoleGrantEveryStartupProbeCheck reads
+// rbacspec.ControllerNamespaceChecks -- the SAME list cmd/controller.go's
+// probeNamespace uses at startup, and cmd/controller_test.go's
+// TestProbeNamespaceChecksMatchRBACMarkers cross-checks against the
+// +kubebuilder:rbac markers -- and asserts the chart's rendered per-namespace
+// Role (for every namespaced entry) and ClusterRole (for every
+// ClusterScoped entry) actually grant it.
+//
+// Before this test existed, the assertions above (TestControllerRolePerNamespace)
+// restated the expected verb sets by hand, and that restatement was exactly
+// what drifted silently: the chart's rendered Role was missing update/patch
+// on serviceaccounts and list/watch/update/patch on rolebindings, invisible
+// to every suite because envtest's default client bypasses RBAC entirely --
+// found only by standing the chart up on a real cluster (Task 13a). This
+// test reads the requirement from the one place it is declared, so the
+// NEXT verb added to rbacspec.ControllerNamespaceChecks and forgotten in
+// the chart fails HERE, naming the exact group/resource/verb, instead of
+// stalling a real cluster's manager cache with nothing in the logs
+// pointing at RBAC.
+//
+// Superset, not exact-equality, deliberately: this test's job is coverage
+// (does the chart grant what the probe needs), not least-privilege (does it
+// grant ONLY that) -- the assertVerbSetEqual calls above already pin the
+// exact set and catch over-privilege too. This test does not replace them,
+// it closes the gap they cannot: they are a second hand-written copy of the
+// same requirement, so a verb added to rbacspec.ControllerNamespaceChecks
+// and never added to THIS test's expectations (or to the chart) would still
+// drift undetected -- reading directly from rbacspec is what removes that
+// second copy.
+func TestChartRoleAndClusterRoleGrantEveryStartupProbeCheck(t *testing.T) {
+	opts := defaultOpts()
+	set := decodeRendered(t, helmTemplate(t, opts))
+	if len(set.clusterRoles) != 1 {
+		t.Fatalf("want exactly 1 ClusterRole, got %d", len(set.clusterRoles))
+	}
+	clusterRole := set.clusterRoles[0]
+
+	type groupResource struct{ group, resource string }
+	namespacedVerbs := map[groupResource][]string{}
+	clusterScopedVerbs := map[groupResource][]string{}
+	for _, c := range rbacspec.ControllerNamespaceChecks {
+		k := groupResource{c.Group, c.Resource}
+		if c.ClusterScoped {
+			clusterScopedVerbs[k] = append(clusterScopedVerbs[k], c.Verb)
+		} else {
+			namespacedVerbs[k] = append(namespacedVerbs[k], c.Verb)
+		}
+	}
+
+	for _, ns := range opts.watchNamespaces {
+		role := roleInNamespace(t, set.roles, v1alpha1.OperatorServiceAccountName, ns)
+		for k, verbs := range namespacedVerbs {
+			assertProbeCheckGranted(t, role.Rules, "Role", ns, k.group, k.resource, verbs)
+		}
+	}
+
+	for k, verbs := range clusterScopedVerbs {
+		assertProbeCheckGranted(t, clusterRole.Rules, "ClusterRole", "", k.group, k.resource, verbs)
+	}
+}
+
+// assertProbeCheckGranted asserts rules grants every verb in want for
+// group/resource -- kind names which rendered object (Role/ClusterRole) and
+// ns names which namespace, purely for an error message that points
+// straight at the drifted grant rather than a bare verb string.
+func assertProbeCheckGranted(t *testing.T, rules []rbacv1.PolicyRule, kind, ns, group, resource string, want []string) {
+	t.Helper()
+	got := ruleVerbs(rules, group, resource)
+	where := kind
+	if ns != "" {
+		where = fmt.Sprintf("%s (namespace %s)", kind, ns)
+	}
+	if got == nil {
+		t.Errorf("%s has no rule for group=%q resource=%q, but rbacspec.ControllerNamespaceChecks requires verbs %v -- the controller's own startup probe checks this and its manager cache will not sync without it", where, group, resource, want)
+		return
+	}
+	for _, w := range want {
+		if !containsStr(got, w) {
+			t.Errorf("%s group=%q resource=%q is missing verb %q, which rbacspec.ControllerNamespaceChecks requires -- the controller's own startup probe checks this verb, and (for a namespaced watch the controller Owns()) a missing list/watch stalls the manager's cache sync fleet-wide with no crash and nothing in the logs pointing at RBAC", where, group, resource, w)
 		}
 	}
 }
