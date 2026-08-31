@@ -47,10 +47,12 @@ of the tool server even though the subsequent invocation would have waited
 indefinitely. Any value above ~10 s buys nothing on discovery and should be
 justified by the invocation path alone.
 
-**Caveat — pin the version before relying on this.** v0.11.1's changelog
-includes a fix to session-credential attribution on this exact path
-(upstream PR #28630); neighbouring releases differ. Re-check against the
-version actually deployed on the edge cluster.
+**Version caveat — RESOLVED.** The concern was that v0.11.1's changelog
+touches this exact path (upstream PR #28630), so neighbouring releases
+differ. The production instance runs
+`ghcr.io/open-webui/open-webui:0.11.1` — read off the live Deployment —
+which is the same version these answers were read against. They apply
+exactly; nothing here is extrapolated across releases.
 
 `examples/workspace-app.yaml` currently sets `router.coldStartHoldSeconds: 60`.
 That is consumer A's value and is not governed by this measurement.
@@ -93,37 +95,105 @@ live hole in the Open WebUI path, because it does not.
 duplicated-header variant must be driven by a **direct client**, not through
 Open WebUI, since Open WebUI cannot be made to emit two identity headers.
 
-Same version caveat as Step 1.
+Same version basis as Step 1, and equally exact: production runs the very
+version this was read against.
 
 ---
 
-## Step 3 — consumer B image identity and legacy home sizes — PARTIAL
+## Step 3 — consumer B image identity, id transformation and legacy sizes — ANSWERED
 
-Read off the consumer B image:
+All of this is read off the **live production deployment** and its database,
+read-only. No production state was modified.
 
-- Account: `uid=1000(user)`, and exactly **one** home directory,
-  `/home/user`, at **20K**.
+### Container identity
 
-**Still needed:** the transformation between `X-User-Id` and the account
-name, and — if that transformation is not invertible — a forward mapping
-from Open WebUI's own user table to directory names, halting on any
-collision. Not yet done.
+`id` inside the running container: **`uid=1000(user) gid=1000(user)
+groups=1000(user)`**. So consumer B's CR takes `runAsUser: 1000`,
+`runAsGroup: 1000`, `fsGroup: 1000`. These are numeric, which is what the
+operator's validation requires — the chart refers to the account by name
+only, so the number is written down nowhere else.
 
-**Related production finding (already surfaced separately):** consumer B's
-production Deployment mounts its `workspace` volume as `emptyDir: {}` at
-`/home/user` with no PVC. That data does not survive a pod restart today,
-which is both a standing data-loss condition and the reason the 20K figure
-above is small — there is effectively nothing accumulated to migrate.
+### The identity → account-name transformation — **NOT INVERTIBLE**
 
----
+Read from the image's own `…/utils/user_isolation.py`
+(`sanitize_username`). The rule, exactly:
 
-## Step 4 — cold-start distribution — PENDING, BLOCKED
+1. lowercase the identity, then delete every character outside `[a-z0-9]`
+   (for a UUID this removes the four dashes, leaving 32 hex characters);
+2. if at least 4 characters remain, take the **first 8**; otherwise fall
+   back to the first 8 hex digits of `sha256(identity)`;
+3. prepend the consumer's optional user-prefix env var (**unset in
+   production** — the container's only env var is its API key);
+4. prepend `u` if the result starts with a digit.
 
-**Blocked on production cluster access.** This step requires deploying the
-operator to the production edge cluster and creating ten PVCs on production
-Ceph. The dev, auto and airgapped edge environments are all unreachable, and
-this measurement cannot be taken on kind — a kind cluster's storage is not
-the storage whose behaviour is being measured.
+The home is then `/home/<that name>`.
+
+**Step 3's stop-and-record condition is met: 36 characters collapse to 8, so
+the mapping cannot be inverted.** Per the plan, the source of truth is
+therefore the application's own user table, mapped **forward**.
+
+### The forward map, computed over the real user table
+
+Production Open WebUI has **8 users**. Every identity is a canonical
+36-character UUID (`^[0-9a-f-]+$`, all 36 chars, verified by a length and
+charset query over the whole table).
+
+Applying the rule above to all 8: **8 distinct account names, zero
+collisions.** The migration can proceed for every existing user without
+guessing, and its halt-on-collision path is not triggered by today's data.
+
+One incidental: all 8 identities begin with a digit (verified twice by
+independent queries), so every derived name takes the `u` prefix and is
+9 characters — `u` followed by 8 hex. A migration that assumes an 8-character
+name would miss every existing home.
+
+No user identifiers were emitted from the cluster; only the aggregate counts
+above.
+
+### Legacy home sizes — **there are none, and this is the important finding**
+
+The live container has exactly one home, `/home/user`, at **20K**, owned by
+the single shared account. There are **no per-user homes to size against**,
+because multi-user mode has never run in production.
+
+Consumer B's `storage.size` therefore **cannot** be derived from a per-user
+`du`, as the plan's Step 3 assumed. It has to come from the budget in
+Step 4 plus a growth assumption, and it must be recorded as such — it can
+never be lowered once set.
+
+`limits.maxWorkspaces` for consumer B is bounded by **8** users today.
+
+## Step 4 — cold-start distribution — HALF ANSWERED, HALF BLOCKED
+
+### The storage budget — ANSWERED
+
+Read from the production Ceph cluster, read-only:
+
+| Quantity | Value |
+|---|---|
+| RAW capacity | 594 GiB |
+| RAW used | 42.25% |
+| `replicapool` MAX AVAIL | **313 GiB** |
+
+`replicapool` is the pool behind the `ceph-block-static` StorageClass, so
+**313 GiB is the entire budget** that `storage.size × maxWorkspaces` is
+fixed against — for both consumers together, plus every other RBD claim on
+the cluster. It is a single-node cluster; there is no second failure domain
+to grow into.
+
+Working the constraint backwards for consumer B at 8 users: even a generous
+20 GiB per workspace is 160 GiB, over half the pool, before consumer A takes
+anything. `maxWorkspaces` for consumer B should be set from the real user
+count with headroom (say 16), not from a round number.
+
+### The cold-start distribution — still PENDING
+
+**Blocked on authorisation, not on reachability.** The earlier record said
+no edge cluster was reachable; that is now known to be wrong — the
+production edge cluster answers. What the measurement needs is permission,
+because it means deploying the operator to production and creating ten PVCs
+on the production Ceph pool measured above. It cannot be taken on kind: a
+kind cluster's storage is not the storage whose behaviour is being measured.
 
 Consequently these remain **unmeasured guesses** and are marked `# TASK 15`
 in `examples/workspace-app.yaml`:
@@ -132,15 +202,14 @@ in `examples/workspace-app.yaml`:
 |---|---|---|---|
 | `limits.maxConcurrentStarts` | A | `5` | guess |
 | `storage.size` | A | `1Gi` | test value — **can never be lowered once set** |
-| `limits.maxWorkspaces` | A | `50` | test value |
-| `storage.size` | B | — | not set; must come from Step 3's per-user sizes |
-| `limits.maxWorkspaces` | B | — | not set |
+| `limits.maxWorkspaces` | A | `50` | test value — against a 313 GiB pool, `1Gi x 50` fits; a later `storage.size` raise does not |
+| `storage.size` | B | — | not set; **cannot** come from per-user sizes (Step 3: none exist) |
+| `limits.maxWorkspaces` | B | — | not set; bounded by 8 real users today |
 
 When the step runs, it must record: p50 and p95 of the ten cold starts, the
-derivation from p95 to `maxConcurrentStarts`, and the shared OSD's
-`ceph df` MAX AVAIL headroom that `storage.size × maxWorkspaces` is fixed
-against — **per app**. Consumer A's p95 is not consumer B's: the two differ
-in image size, RBD working set and boot cost.
+derivation from p95 to `maxConcurrentStarts`, and the MAX AVAIL headroom
+above — **per app**. Consumer A's p95 is not consumer B's: the two differ in
+image size, RBD working set and boot cost.
 
 Two invocation constraints for whoever runs it:
 
@@ -153,7 +222,36 @@ Two invocation constraints for whoever runs it:
 
 ---
 
+## Production divergence — what consumer B actually runs today
+
+Recorded because Task 16's migration and Task 17's cutover both assume a
+source that does not exist yet.
+
+The **deployed** consumer B workload is the single-user render: one shared
+account, home on an `emptyDir` (not a PVC), multi-user mode not enabled at
+all, image tag `0.12.3`, unchanged for over three months.
+
+The **committed chart** — already merged and already inside the pinned
+submodule the next release builds from — switches it to multi-user with a
+50 GiB `Retain` PVC and a root init container.
+
+Two consequences worth stating plainly:
+
+1. **Today there is a standing data-loss exposure.** The shared home is
+   20K on an `emptyDir`; a pod reschedule discards it. Small, but it is
+   user data with no persistence behind it.
+2. **Task 16's migration has no source data until that chart ships.** The
+   per-user homes it copies from are created by the multi-user mode that
+   has never run. The migration is still worth building — it is correct if
+   the release happens, inert if it does not, and unrecoverable to skip if
+   it does — but it cannot be validated against production until then.
+
+---
+
 ## Step 5 — record and commit — IN PROGRESS
 
-Steps 1 and 2 are recorded above and committed. Steps 3 (partly) and 4
-remain open; this file is where their answers go.
+Steps 1, 2 and 3 are recorded above and committed, as is Step 4's storage
+budget. What remains open is Step 4's cold-start distribution, which needs
+authorisation to run against production. Task 14 Step 5 — substituting the
+measured values into `examples/workspace-app.yaml` and deleting its `# TASK 15`
+markers — waits on that one number.
