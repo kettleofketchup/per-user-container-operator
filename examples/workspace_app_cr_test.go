@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 
 	"github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
@@ -294,6 +295,10 @@ func walkPodSpec(t *testing.T, spec corev1.PodSpec) []string {
 // current expressibility mapping.
 func TestWorkspaceAppGoldenPodSpecIsExpressible(t *testing.T) {
 	golden := loadGoldenPodSpec(t)
+	goldenPath := filepath.Join(packageDir(), "..", "test", "e2e", "testdata", "workspace-app-podspec.yaml")
+	if len(golden.Containers) < 1 || len(golden.InitContainers) < 1 || len(golden.Volumes) < 3 {
+		t.Fatalf("golden PodSpec %s parsed to %d container(s), %d init container(s), %d volume(s) -- want at least 1, 1, 3 (truncated or wrongly-parsed fixture?)", goldenPath, len(golden.Containers), len(golden.InitContainers), len(golden.Volumes))
+	}
 	if bad := walkPodSpec(t, golden); len(bad) > 0 {
 		t.Fatalf("golden PodSpec has %d field(s) not expressible via spec.workspace or a CR value:\n  %s", len(bad), strings.Join(bad, "\n  "))
 	}
@@ -335,12 +340,25 @@ func TestWorkspaceAppCRAssertions(t *testing.T) {
 		t.Fatalf("spec.workspace.env does not contain HOME=/workspace/home (env=%+v)", app.Spec.Workspace.Env)
 	})
 
+	t.Run("Resources", func(t *testing.T) {
+		res := app.Spec.Workspace.Resources
+		if want, got := resource.MustParse("1Gi"), res.Limits[corev1.ResourceMemory]; got.Cmp(want) != 0 {
+			t.Fatalf("spec.workspace.resources.limits.memory = %s, want %s", got.String(), want.String())
+		}
+		if want, got := resource.MustParse("250m"), res.Requests[corev1.ResourceCPU]; got.Cmp(want) != 0 {
+			t.Fatalf("spec.workspace.resources.requests.cpu = %s, want %s", got.String(), want.String())
+		}
+		if want, got := resource.MustParse("512Mi"), res.Requests[corev1.ResourceMemory]; got.Cmp(want) != 0 {
+			t.Fatalf("spec.workspace.resources.requests.memory = %s, want %s", got.String(), want.String())
+		}
+	})
+
 	t.Run("ScratchVolume", func(t *testing.T) {
 		var scratchVol *corev1.Volume
 		for i := range app.Spec.Workspace.Volumes {
 			v := &app.Spec.Workspace.Volumes[i]
 			if v.Name == v1alpha1.PVCVolumeName {
-				t.Fatalf("spec.workspace.volumes declares a volume literally named %q, the RESERVED per-user PVC volume name -- this is exactly the rename task-14-brief.md section (b) requires: the chart's own `workspace` emptyDir must be renamed to something else before it lands here", v1alpha1.PVCVolumeName)
+				t.Fatalf("spec.workspace.volumes declares a volume literally named %q, the operator's reserved per-user PVC volume name -- ValidateApp rejects any user volume that reuses it", v1alpha1.PVCVolumeName)
 			}
 			if v.EmptyDir != nil {
 				scratchVol = v

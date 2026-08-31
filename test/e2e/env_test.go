@@ -10,6 +10,7 @@ package e2e
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -150,6 +151,9 @@ func loadEnv() (e2eEnv, error) {
 	n, err := strconv.Atoi(csi)
 	if err != nil {
 		return e2eEnv{}, fmt.Errorf("PUC_E2E_COLD_START_IDENTITIES=%q: %w", csi, err)
+	}
+	if n < 1 {
+		return e2eEnv{}, fmt.Errorf("PUC_E2E_COLD_START_IDENTITIES=%q: %w", csi, errors.New("must be >= 1"))
 	}
 	env.ColdStartIdentities = n
 

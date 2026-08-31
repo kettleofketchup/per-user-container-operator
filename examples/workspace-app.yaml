@@ -13,9 +13,15 @@
 # a real value transcribed from the golden or the operator's design deltas
 # (task-14-brief.md sections (a) and (b)) -- see that file for the full
 # reasoning, in particular why the chart's own `workspace` emptyDir is
-# renamed to `app-scratch` below (the operator's per-user PVC volume
-# reserves a name of its own, v1alpha1.PVCVolumeName, and a CR transcribing
-# the chart's volume verbatim risks a duplicate pod-spec volume name).
+# renamed to `app-scratch` below (it is a 16Mi tmpfs at /workspace/.app,
+# not the persistent workspace -- that is the per-user PVC, mounted at
+# spec.storage.mountPath; keeping the chart's name here would point a
+# reader at the wrong volume).
+#
+# Three values here are harness-only, good for this repo's own E2E run and
+# nothing else: storage.storageClassName, callerAuth.secretRef.name, and
+# the `# TASK 15`-marked sizing above. A real deployment substitutes its
+# own values for all three.
 #
 # storage.storageClassName is this repo's own E2E StorageClass
 # (test/e2e/kind-up.sh); a real deployment substitutes its own
@@ -85,8 +91,13 @@ spec:
       failureThreshold: 6
     volumes:
       # DELTA (task-14-brief.md section (b)): the chart's own `workspace`
-      # emptyDir, renamed. Never reuse v1alpha1.PVCVolumeName or the pod
-      # spec ends up with two volumes fighting for one name.
+      # emptyDir, renamed. In a PerUserApp the persistent workspace is the
+      # per-user PVC (spec.storage.mountPath: /workspace); keeping the
+      # chart's name here would point a reader at the wrong volume. It also
+      # diverges from the golden in shape, not just name: the golden's
+      # `workspace` is a disk-backed, unbounded emptyDir: {}, while this one
+      # is a capped 16Mi medium: Memory tmpfs -- a different path from the
+      # PVC's own mount.
       - name: app-scratch
         emptyDir:
           medium: Memory
@@ -108,6 +119,14 @@ spec:
     volumeMounts:
       - name: app-scratch
         mountPath: /workspace/.app
+    # Chart-native (section (a)): the container's own resource requests and
+    # limits, unchanged from the render.
+    resources:
+      limits:
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 512Mi
     initContainers:
       # Chart-native (section (a)): same image, same script, same three
       # mounts as the golden's render-config init container.
