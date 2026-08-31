@@ -52,7 +52,16 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["serviceaccounts"]
-    verbs: ["get", "list", "watch", "create"]
+    # get/list/watch/create/update/patch -- matches cmd/controller.go's
+    # controllerNamespaceChecks exactly (Task 13a found this while standing
+    # the E2E harness up: update/patch were missing here, which never
+    # blocked SA creation itself but DID make the controller's own
+    # RoleBinding informer below fail to establish -- see that comment --
+    # which stalls the manager's entire cache sync and every reconciler
+    # with it. Task 11's probe list is the correct requirement; this Role
+    # had drifted from it, invisibly, because envtest's default client is
+    # not RBAC-constrained the way the chart-rendered Role is).
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
@@ -61,5 +70,12 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["rolebindings"]
-    verbs: ["create", "get"]
+    # get/list/watch/create/update/patch -- see the serviceaccounts comment
+    # above. list/watch were the two verbs actually starving the manager:
+    # WorkspaceReconciler/PerUserAppReconciler watch RoleBindings as a child
+    # resource, that watch's initial List 403s under the get/create-only
+    # grant this Role previously carried, and the manager's cache never
+    # finishes syncing -- so NO reconciler ever runs, in any namespace,
+    # with no crash and no obviously-related log line pointing at RBAC.
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
 {{- end }}

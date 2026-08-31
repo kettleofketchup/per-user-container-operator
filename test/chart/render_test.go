@@ -470,10 +470,23 @@ func TestControllerRolePerNamespace(t *testing.T) {
 		}
 		assertVerbSetEqual(t, rules, "networking.k8s.io", "networkpolicies", []string{"get", "list", "watch", "create", "update", "patch", "delete"})
 
-		assertVerbSetEqual(t, rules, "", "serviceaccounts", []string{"get", "list", "watch", "create"})
+		// get/list/watch/create/update/patch on both: matches
+		// cmd/controller.go's controllerNamespaceChecks exactly. Found
+		// missing (update/patch on serviceaccounts; list/watch/update/patch
+		// on rolebindings) while standing up Task 13's E2E harness on a real
+		// cluster: envtest's default client bypasses RBAC entirely, so this
+		// drift between the chart's rendered Role and the controller's own
+		// probe list was invisible to every existing suite. The missing
+		// rolebindings list/watch is the one that actually mattered --
+		// WorkspaceReconciler/PerUserAppReconciler watch RoleBindings as a
+		// child resource, that watch's initial List 403s without it, and
+		// the manager's cache never finishes syncing -- so no reconciler
+		// ever runs, in any namespace, with no crash and nothing in the
+		// logs obviously pointing at RBAC.
+		assertVerbSetEqual(t, rules, "", "serviceaccounts", []string{"get", "list", "watch", "create", "update", "patch"})
 		assertVerbSetEqual(t, rules, "", "events", []string{"create", "patch"})
 		assertVerbSetEqual(t, rules, "discovery.k8s.io", "endpointslices", []string{"get", "list", "watch"})
-		assertVerbSetEqual(t, rules, "rbac.authorization.k8s.io", "rolebindings", []string{"create", "get"})
+		assertVerbSetEqual(t, rules, "rbac.authorization.k8s.io", "rolebindings", []string{"get", "list", "watch", "create", "update", "patch"})
 
 		rb := findRoleBinding(t, set.roleBindings, "per-user-container-operator", ns)
 		if rb.RoleRef.Name != role.Name || rb.RoleRef.Kind != "Role" {
