@@ -218,17 +218,40 @@ func TestValidateRequiresFsGroupAndNumericUser(t *testing.T) {
 	})
 }
 
-// Egress: a selector peer renders and applies and silently drops on Calico.
-// Also enforced by CEL (Task 4); both layers, because the API-server rule is
-// bypassed by prune-and-recreate and the Go rule runs after admission.
-func TestValidateRejectsSelectorEgressAndEmptyRouterIngress(t *testing.T) {
-	t.Run("selector egress peer", func(t *testing.T) {
+// Egress: a selector peer (podSelector or namespaceSelector) is accepted --
+// NetworkPolicy egress is evaluated against the POST-DNAT destination, so a
+// selector peer correctly resolves to its backing pods' real IPs. It is
+// ipBlock naming a Service's ClusterIP that silently fails (kube-proxy has
+// already rewritten the destination by the time policy is evaluated), which
+// is exactly why this validation does NOT single out selector peers as the
+// unsafe case; see NetworkSpec.WorkspaceEgress's doc comment
+// (api/v1alpha1/peruserapp_types.go).
+func TestValidateAcceptsSelectorEgressAndRejectsEmptyRouterIngress(t *testing.T) {
+	t.Run("selector egress peer accepted", func(t *testing.T) {
 		app := validApp()
 		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
-			{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}}},
+			{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "prometheus"}}}}},
+		}
+		if _, err := ValidateApp(app); err != nil {
+			t.Fatalf("podSelector egress peer rejected: %v", err)
+		}
+	})
+	t.Run("namespaceSelector egress peer accepted", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": "monitoring"}}}}},
+		}
+		if _, err := ValidateApp(app); err != nil {
+			t.Fatalf("namespaceSelector egress peer rejected: %v", err)
+		}
+	})
+	t.Run("peer with no ipBlock/podSelector/namespaceSelector rejected", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{}}},
 		}
 		if _, err := ValidateApp(app); err == nil {
-			t.Fatal("selector egress peer accepted; Calico drops it silently")
+			t.Fatal("empty peer (no ipBlock, podSelector or namespaceSelector) accepted; it selects nothing meaningful and is not a peer any user meant to write")
 		}
 	})
 	t.Run("egress rule with no to", func(t *testing.T) {
@@ -532,10 +555,10 @@ func TestSeederMountsClaimAtStagingPathAndRunsFirst(t *testing.T) {
 }
 
 // The workspace egress policy has no other test. Step 3 item 4 makes it
-// default-deny + DNS + the declared ipBlock peers, but every assertion that
+// default-deny + DNS + the declared peers, but every assertion that
 // looks like it covers this is about ingress:
 // TestWorkspaceIngressSelectsAllThreeRouterLabels reads the ingress rule and
-// the node-CIDR admission, and TestValidateRejectsSelectorEgressAndEmptyRouterIngress
+// the node-CIDR admission, and TestValidateAcceptsSelectorEgressAndRejectsEmptyRouterIngress
 // exercises ValidateApp, not the renderer. A renderer that omits
 // policyTypes: Egress, or forgets the DNS rule, or drops
 // network.workspaceEgress on the floor, passes every other unit test here —

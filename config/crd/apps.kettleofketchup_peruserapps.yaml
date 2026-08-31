@@ -160,7 +160,7 @@ spec:
                   `make manifests` will NOT reproduce that patch (controller-gen has no
                   marker to attach there); until Task 4/5's API design gives egress peers
                   a bounded first-party type, `make manifests` output for this field must
-                  be re-patched by hand and TestSelectorEgressPeerIsRejectedByTheAPIServer
+                  be re-patched by hand and TestSelectorEgressPeerIsAcceptedByTheAPIServer
                   (test/envtest/cel_test.go) re-run to confirm the CRD still installs.
                 properties:
                   routerIngress:
@@ -305,6 +305,29 @@ spec:
                         type: boolean
                     type: object
                   workspaceEgress:
+                    description: |-
+                      WorkspaceEgress declares the peers a workspace pod may initiate
+                      traffic to, beyond the DNS-anywhere and per-app router rules this
+                      operator always renders. All three NetworkPolicyPeer kinds are
+                      accepted (ipBlock, podSelector, namespaceSelector) -- but not
+                      interchangeably for reaching a Kubernetes Service:
+
+                      A Service's ClusterIP is a virtual address that kube-proxy DNAT-rewrites
+                      to a real backend pod IP before ordinary NetworkPolicy egress rules are
+                      evaluated (this is standard Kubernetes NetworkPolicy semantics, true of
+                      every CNI enforcing it via iptables/ipvs, not a Calico- or
+                      implementation-specific quirk). An ipBlock peer naming that ClusterIP's
+                      /32 therefore never matches the packet policy actually evaluates, and
+                      the rule renders, applies, and silently drops every connection to that
+                      Service -- this operator's own router NetworkPolicy avoids the exact
+                      same trap for its apiserver access by using the node's CIDR rather
+                      than the apiserver Service's ClusterIP (see RenderRouterNetworkPolicy).
+
+                      To let a workspace reach a Service, select its BACKING PODS instead --
+                      a podSelector (with a namespaceSelector when the Service lives in
+                      another namespace) resolves to those pods' real, post-DNAT IPs and is
+                      evaluated correctly. Reserve ipBlock for a genuinely IP-addressed peer
+                      (an external endpoint, a raw pod or node CIDR).
                     items:
                       description: |-
                         NetworkPolicyEgressRule describes a particular set of traffic that is allowed out of pods
@@ -501,11 +524,11 @@ spec:
                 type: object
                 x-kubernetes-validations:
                 - message: 'every workspaceEgress rule needs a non-empty to, and every
-                    peer must be ipBlock: an absent to means allow-to-anywhere, and
-                    Calico evaluates egress pre-DNAT so a selector-based peer renders,
-                    applies and silently drops'
+                    peer must set ipBlock, podSelector or namespaceSelector: an absent
+                    to means allow-to-anywhere, reaching every other workspace and
+                    the router'
                   rule: self.workspaceEgress.all(r, r.to.size() > 0 && r.to.all(p,
-                    has(p.ipBlock)))
+                    has(p.ipBlock) || has(p.podSelector) || has(p.namespaceSelector)))
               router:
                 description: RouterSpec configures the shared router Deployment for
                   this app.

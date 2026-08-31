@@ -75,7 +75,17 @@ func TestStorageShrinkCELRejectsAnUpdate(t *testing.T) {
 	}
 }
 
-func TestSelectorEgressPeerIsRejectedByTheAPIServer(t *testing.T) {
+// TestSelectorEgressPeerIsAcceptedByTheAPIServer: a podSelector (or
+// namespaceSelector) workspaceEgress peer is valid -- NetworkPolicy egress
+// is evaluated against the POST-DNAT destination, so a selector peer
+// correctly resolves to its backing pods' real IPs. It is an ipBlock naming
+// a Service's ClusterIP that silently fails instead (see
+// NetworkSpec.WorkspaceEgress's doc comment in api/v1alpha1/peruserapp_types.go),
+// which is why this CEL rule does not single out selector peers as unsafe.
+// A peer with none of ipBlock/podSelector/namespaceSelector set, and a
+// ports-only rule with `to` omitted entirely (allow-to-anywhere), must both
+// still be rejected.
+func TestSelectorEgressPeerIsAcceptedByTheAPIServer(t *testing.T) {
 	ns := newNamespace(t)
 
 	selectorPeer := validAppFor(ns)
@@ -83,8 +93,17 @@ func TestSelectorEgressPeerIsRejectedByTheAPIServer(t *testing.T) {
 	selectorPeer.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{{
 		To: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}}}},
 	}}
-	if err := k8sClient.Create(context.Background(), selectorPeer); err == nil {
-		t.Fatal("a podSelector egress peer must be rejected")
+	if err := k8sClient.Create(context.Background(), selectorPeer); err != nil {
+		t.Fatalf("a podSelector egress peer must be accepted: %v", err)
+	}
+
+	emptyPeer := validAppFor(ns)
+	emptyPeer.Name = "cel-empty-peer"
+	emptyPeer.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{{
+		To: []networkingv1.NetworkPolicyPeer{{}},
+	}}
+	if err := k8sClient.Create(context.Background(), emptyPeer); err == nil {
+		t.Fatal("a peer with none of ipBlock/podSelector/namespaceSelector must be rejected")
 	}
 
 	allowAnywhere := validAppFor(ns)

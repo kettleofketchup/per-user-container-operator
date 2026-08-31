@@ -68,7 +68,7 @@ func TestGeneratedCRDContainsCELRules(t *testing.T) {
 	for _, rule := range []string{
 		"self.metadata.name.size() <= 27",
 		"quantity(self.size).compareTo(quantity(oldSelf.size)) >= 0",
-		"self.workspaceEgress.all(r, r.to.size() > 0 && r.to.all(p, has(p.ipBlock)))",
+		"self.workspaceEgress.all(r, r.to.size() > 0 && r.to.all(p, has(p.ipBlock) || has(p.podSelector) || has(p.namespaceSelector)))",
 		"duration(self.reapInterval) < duration(self.idleTimeout)",
 	} {
 		if !findRule(t, appDoc, rule) {

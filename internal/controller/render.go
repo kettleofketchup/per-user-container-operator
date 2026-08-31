@@ -382,9 +382,14 @@ func RenderWorkspaceNetworkPolicies(app *v1alpha1.PerUserApp, ws *v1alpha1.Works
 
 // RenderRouterNetworkPolicy renders the single NetworkPolicy scoped to an
 // app's router pods. nodeCIDR is mandatory: without egress to the node
-// block the router cannot reach the apiserver (Calico evaluates egress
-// pre-DNAT, so kubernetes.default.svc is not a valid selector target), and
-// every Workspace create and status patch would fail.
+// block the router cannot reach the apiserver, and every Workspace create
+// and status patch would fail. This uses nodeCIDR rather than a selector
+// peer NOT because of DNAT ordering (see NetworkSpec.WorkspaceEgress's doc
+// comment for the correct, opposite reasoning on that point) but because
+// the "kubernetes" Service in kube-system has no podSelector-compatible
+// backend to select in the first place: it is a manually-managed Endpoints
+// object naming the control-plane host IP(s) directly, not pods carrying a
+// stable label this policy could reference.
 func RenderRouterNetworkPolicy(app *v1alpha1.PerUserApp, podCIDR, nodeCIDR string) *networkingv1.NetworkPolicy {
 	routerPort := intstr.FromInt32(v1alpha1.RouterPort)
 	metricsPort := intstr.FromInt32(v1alpha1.MetricsPort)
@@ -708,8 +713,8 @@ func ValidateApp(app *v1alpha1.PerUserApp) (warnings []string, err error) {
 			return nil, fmt.Errorf("spec.network.workspaceEgress[%d]: to must be non-empty; an absent to is allow-to-anywhere and reaches every other workspace and the router", i)
 		}
 		for j, p := range r.To {
-			if p.IPBlock == nil {
-				return nil, fmt.Errorf("spec.network.workspaceEgress[%d].to[%d]: only ipBlock peers are allowed; Calico evaluates egress pre-DNAT so a selector-based peer renders, applies and silently drops", i, j)
+			if p.IPBlock == nil && p.PodSelector == nil && p.NamespaceSelector == nil {
+				return nil, fmt.Errorf("spec.network.workspaceEgress[%d].to[%d]: peer must set one of ipBlock, podSelector or namespaceSelector", i, j)
 			}
 		}
 	}

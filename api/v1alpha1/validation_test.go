@@ -16,7 +16,7 @@ func TestCELMarkersPresent(t *testing.T) {
 		"self.metadata.name.size() <= 27",
 		"pod name", // the arithmetic, so the failure is diagnosable
 		"quantity(self.size).compareTo(quantity(oldSelf.size)) >= 0", // storage shrink on update
-		"self.workspaceEgress.all(r, r.to.size() > 0 && r.to.all(p, has(p.ipBlock)))",
+		"self.workspaceEgress.all(r, r.to.size() > 0 && r.to.all(p, has(p.ipBlock) || has(p.podSelector) || has(p.namespaceSelector)))",
 		"duration(self.reapInterval) < duration(self.idleTimeout)",
 	} {
 		if !strings.Contains(src, want) {
