@@ -188,12 +188,16 @@ count with headroom (say 16), not from a round number.
 
 ### The cold-start distribution — still PENDING
 
-**Blocked on authorisation, not on reachability.** The earlier record said
-no edge cluster was reachable; that is now known to be wrong — the
-production edge cluster answers. What the measurement needs is permission,
-because it means deploying the operator to production and creating ten PVCs
-on the production Ceph pool measured above. It cannot be taken on kind: a
-kind cluster's storage is not the storage whose behaviour is being measured.
+**Blocked, and the target is fixed: `edge-auto` only.** Production is not an
+option for this measurement — that is a standing constraint, not a
+preference, so the fact that the production cluster happens to answer does
+not make it eligible. `edge-auto` was not responding during this round, so
+the step waits on that environment.
+
+The measurement cannot be taken on kind either: a kind cluster's storage is
+not the storage whose behaviour is being measured. The budget above was read
+from production read-only, which is a different matter from creating PVCs
+there.
 
 Consequently these remain **unmeasured guesses** and are marked `# TASK 15`
 in `examples/workspace-app.yaml`:
