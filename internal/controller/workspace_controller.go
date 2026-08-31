@@ -334,10 +334,8 @@ func (r *WorkspaceReconciler) reconcilePending(ctx context.Context, ws *v1alpha1
 		return ctrl.Result{}, err
 	}
 
-	for _, np := range RenderWorkspaceNetworkPolicies(app, ws, r.PodCIDR, r.NodeCIDR) {
-		if err := r.Create(ctx, np); err != nil && !apierrors.IsAlreadyExists(err) {
-			return ctrl.Result{}, err
-		}
+	if err := r.ensureWorkspaceNetworkPolicies(ctx, ws, app); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	metrics.RecordWorkspaceStart(ws.Namespace, app.Name, "admitted")
@@ -355,6 +353,9 @@ func (r *WorkspaceReconciler) reconcileStarting(ctx context.Context, ws *v1alpha
 		return ctrl.Result{}, err
 	} else if refused {
 		return ctrl.Result{}, nil
+	}
+	if err := r.ensureWorkspaceNetworkPolicies(ctx, ws, app); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	var pods corev1.PodList
@@ -460,11 +461,24 @@ func (r *WorkspaceReconciler) reconcileFailed(_ context.Context, ws *v1alpha1.Wo
 // rows, and keeps storage in sync with the current PerUserApp spec. It is
 // also the sole writer of Deployment.spec.replicas on the scale-down path:
 // the reaper (Task 9) only ever writes status.scaledDown.
+//
+// It also re-ensures the workspace's own NetworkPolicies on every pass, not
+// just at admission: SetupWithManager's Owns(&networkingv1.NetworkPolicy{})
+// means an externally deleted policy (operator error, an ArgoCD prune,
+// anything) DOES enqueue a reconcile of this Workspace, but before this fix
+// a Ready workspace's reconcile landed here and did nothing about it -- the
+// reconciler stayed awake and reported nothing wrong while a live pod ran
+// with its isolation policies permanently gone. See
+// ensureWorkspaceNetworkPolicies's own doc comment for which other phases
+// get the same treatment and why.
 func (r *WorkspaceReconciler) reconcileReady(ctx context.Context, ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp) (ctrl.Result, error) {
 	if refused, err := r.reconcilePVC(ctx, ws, app, true); err != nil {
 		return ctrl.Result{}, err
 	} else if refused {
 		return ctrl.Result{}, nil
+	}
+	if err := r.ensureWorkspaceNetworkPolicies(ctx, ws, app); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if ws.Status.WakeRequestedAt != nil {
@@ -496,12 +510,22 @@ func (r *WorkspaceReconciler) reconcileReady(ctx context.Context, ws *v1alpha1.W
 }
 
 // reconcileIdle implements the Idle->Pending (wake) row and keeps storage in
-// sync while idle.
+// sync while idle. It also re-ensures NetworkPolicies (see
+// ensureWorkspaceNetworkPolicies): an Idle workspace has no running pod
+// (scaledDown, 0 replicas) so a missing policy has no live traffic to
+// expose today, but the wake row above transitions straight to Pending and
+// this keeps the invariant simple and uniform -- every non-Failed phase
+// that reconcilePVC also runs in self-heals its NetworkPolicies the same
+// way, rather than leaving Idle as a second, quieter version of the same
+// gap for someone to rediscover later.
 func (r *WorkspaceReconciler) reconcileIdle(ctx context.Context, ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp) (ctrl.Result, error) {
 	if refused, err := r.reconcilePVC(ctx, ws, app, true); err != nil {
 		return ctrl.Result{}, err
 	} else if refused {
 		return ctrl.Result{}, nil
+	}
+	if err := r.ensureWorkspaceNetworkPolicies(ctx, ws, app); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if ws.Status.WakeRequestedAt != nil {
@@ -510,6 +534,33 @@ func (r *WorkspaceReconciler) reconcileIdle(ctx context.Context, ws *v1alpha1.Wo
 		ws.Status.Phase = v1alpha1.PhasePending
 	}
 	return ctrl.Result{}, nil
+}
+
+// ensureWorkspaceNetworkPolicies creates or updates ws's own ingress/egress
+// NetworkPolicies to match RenderWorkspaceNetworkPolicies's current output,
+// idempotently (controllerutil.CreateOrUpdate only issues an Update when the
+// object actually differs, so a pass that finds everything already correct
+// churns nothing).
+//
+// Called from every phase reconcilePVC also runs in -- the Pending row only
+// after admission (reconcilePending), Starting, Ready, and Idle -- NOT
+// Failed, mirroring reconcilePVC's own phase coverage exactly: a Failed
+// workspace's only way forward is backoffUntil expiring back to Pending
+// (reconcileFailed), which re-admits and re-ensures everything from there,
+// the same precedent that already excuses Failed from reconcilePVC.
+func (r *WorkspaceReconciler) ensureWorkspaceNetworkPolicies(ctx context.Context, ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp) error {
+	for _, desired := range RenderWorkspaceNetworkPolicies(app, ws, r.PodCIDR, r.NodeCIDR) {
+		np := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: desired.Name, Namespace: desired.Namespace}}
+		if _, err := controllerutil.CreateOrUpdate(ctx, r.Client, np, func() error {
+			np.Labels = desired.Labels
+			np.OwnerReferences = desired.OwnerReferences
+			np.Spec = desired.Spec
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ensureReplicas is the only place in this reconciler that writes
