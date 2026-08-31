@@ -26,6 +26,17 @@ type e2eEnv struct {
 	CallerToken         string
 	WorkspaceImage      string
 	ColdStartIdentities int
+	// WorkspacePort is PUC_E2E_WORKSPACE_PORT: the port the substitute
+	// image named by PUC_E2E_WORKSPACE_IMAGE actually listens on. Optional,
+	// and zero when unset -- meaning "leave every CR's own
+	// spec.workspace.port alone", which is what a live-cluster invocation
+	// running a consumer's real image wants. kind-up.sh sets it because its
+	// fixture image is nginx-unprivileged on 8080 while
+	// examples/workspace-app.yaml declares workspace-app's own 7399: a CR whose image is
+	// substituted but whose port is not never passes readiness, and the
+	// router answers 503 for the whole cold-start hold with nothing in the
+	// failure naming the port.
+	WorkspacePort int
 	// MigrationImage is Task 16's PUC_E2E_MIGRATION_IMAGE. It is not
 	// required here: kind-up.sh does not set it (Task 16's migration image
 	// does not exist at this point in the plan), so it is read
@@ -141,6 +152,14 @@ func loadEnv() (e2eEnv, error) {
 		return e2eEnv{}, fmt.Errorf("PUC_E2E_COLD_START_IDENTITIES=%q: %w", csi, err)
 	}
 	env.ColdStartIdentities = n
+
+	if wp := getenv(fileVars, "PUC_E2E_WORKSPACE_PORT"); wp != "" {
+		p, err := strconv.Atoi(wp)
+		if err != nil {
+			return e2eEnv{}, fmt.Errorf("PUC_E2E_WORKSPACE_PORT=%q: %w", wp, err)
+		}
+		env.WorkspacePort = p
+	}
 
 	tokenBytes, err := os.ReadFile(env.CallerTokenFile)
 	if err != nil {

@@ -71,11 +71,25 @@ func checkCNIIsCalico(ctx context.Context, cs kubernetes.Interface) error {
 // the same primitive kind-up.sh itself uses, not production code, and a
 // plain kubectl invocation is far less code to get right.
 func kubectlExec(kubeconfig, ns, pod string, args ...string) (string, error) {
+	return kubectlExecContainer(kubeconfig, ns, pod, "", args...)
+}
+
+// kubectlExecContainer is kubectlExec with an explicit container. Naming the
+// container is not cosmetic on a multi-container pod: kubectl picks the
+// first one and prints `Defaulted container "x" out of: ...` to stderr,
+// which CombinedOutput folds into the returned string and any caller
+// comparing that string against a file's contents then fails on the notice
+// rather than on the file. Pass "" for a single-container pod.
+func kubectlExecContainer(kubeconfig, ns, pod, container string, args ...string) (string, error) {
 	cmdArgs := []string{}
 	if kubeconfig != "" {
 		cmdArgs = append(cmdArgs, "--kubeconfig", kubeconfig)
 	}
-	cmdArgs = append(cmdArgs, "-n", ns, "exec", pod, "--")
+	cmdArgs = append(cmdArgs, "-n", ns, "exec", pod)
+	if container != "" {
+		cmdArgs = append(cmdArgs, "-c", container)
+	}
+	cmdArgs = append(cmdArgs, "--")
 	cmdArgs = append(cmdArgs, args...)
 	out, err := exec.CommandContext(context.Background(), "kubectl", cmdArgs...).CombinedOutput()
 	return string(out), err

@@ -41,6 +41,7 @@
 #   PUC_E2E_NAMESPACES           the two namespaces this script creates
 #   PUC_E2E_CALLER_TOKEN_FILE    path to the caller bearer this script wrote
 #   PUC_E2E_WORKSPACE_IMAGE      the fixture workspace image built below
+#   PUC_E2E_WORKSPACE_PORT       the port that fixture image listens on
 #   PUC_E2E_COLD_START_IDENTITIES 1 (see task-13a-brief.md Step 0's table)
 #   PUC_E2E_KUBECONFIG           kubeconfig this script wrote for the cluster
 #
@@ -70,8 +71,20 @@ POD_SUBNET=10.244.0.0/16
 CALICO_CHART_VERSION=v3.29.3
 IMG="${IMG:-per-user-container-operator:dev}"
 WORKSPACE_IMG=puc-e2e-workspace:e2e
+# The port WORKSPACE_IMG listens on (nginx-unprivileged's own default).
+# Must stay equal to spec.workspace.port in test/e2e/testdata/e2e-app*.yaml;
+# it is exported so a test substituting WORKSPACE_IMG into a consumer CR
+# written against that consumer's own port can substitute the port too.
+WORKSPACE_PORT=8080
 CALLER_TOKEN_VALUE=puc-e2e-caller-token-fixed
 WORKSPACE_TOKEN_VALUE=puc-e2e-workspace-token-fixed
+# Task 14: workspace-app's real render-config init container mounts a
+# `litellm-secret` Secret with `optional: true` and blocks forever on
+# `until [ -s /secret/master-key ]` until it exists AND is non-empty. This
+# harness has no real LiteLLM to mirror a key from, so a fixed, non-empty
+# value is created directly below -- see this script's "Credential Secrets"
+# section.
+LITELLM_MASTER_KEY_VALUE=puc-e2e-litellm-master-key-fixed
 
 KUBECONFIG_PATH="${SCRIPT_DIR}/.kubeconfig"
 ENV_FILE="${SCRIPT_DIR}/.generated-env"
@@ -310,6 +323,13 @@ for ns in "$NS1" "$NS2"; do
   "${KCTL[@]}" -n "$ns" create secret generic puc-e2e-workspace \
     --from-literal=api-key="$WORKSPACE_TOKEN_VALUE" \
     --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
+  # Task 14: see LITELLM_MASTER_KEY_VALUE's own comment above. The key name
+  # (master-key) and Secret name (litellm-secret) match what
+  # examples/workspace-app.yaml's spec.workspace.volumes names, which is itself
+  # transcribed verbatim from the real workspace-app chart's Secret volume.
+  "${KCTL[@]}" -n "$ns" create secret generic litellm-secret \
+    --from-literal=master-key="$LITELLM_MASTER_KEY_VALUE" \
+    --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
 done
 
 # --- CRDs -------------------------------------------------------------
@@ -476,6 +496,7 @@ PUC_E2E_STORAGECLASS=${STORAGECLASS}
 PUC_E2E_NAMESPACES=${NS1},${NS2}
 PUC_E2E_CALLER_TOKEN_FILE=${CALLER_TOKEN_FILE}
 PUC_E2E_WORKSPACE_IMAGE=${WORKSPACE_IMG}
+PUC_E2E_WORKSPACE_PORT=${WORKSPACE_PORT}
 PUC_E2E_COLD_START_IDENTITIES=1
 PUC_E2E_KUBECONFIG=${KUBECONFIG_PATH}
 EOF

@@ -70,12 +70,28 @@ func runInPod(kubeconfig, ns, pod string, args ...string) (string, error) {
 	return kubectlExec(kubeconfig, ns, pod, args...)
 }
 
+// workspaceContainerName mirrors internal/controller/render.go's constant of
+// the same name -- the container this operator renders a workspace pod's
+// user workload into. It is duplicated rather than imported because that
+// constant is unexported in an internal package; if it ever changes, every
+// marker helper below fails loudly with kubectl's own "container not found".
+const workspaceContainerName = "workspace"
+
+// runInWorkspaceContainer is runInPod pinned to the workspace container.
+// Every marker helper below uses it because a consumer CR may declare init
+// containers of its own (examples/workspace-app.yaml renders three containers in
+// total), and an unpinned exec then returns kubectl's "Defaulted container"
+// notice ahead of the file contents -- see kubectlExecContainer.
+func runInWorkspaceContainer(kubeconfig, ns, pod string, args ...string) (string, error) {
+	return kubectlExecContainer(kubeconfig, ns, pod, workspaceContainerName, args...)
+}
+
 // writeMarker writes content to path inside pod via an exec redirect.
 // content is deliberately restricted to this package's own marker values
 // (fixed identifiers, never arbitrary/attacker-controlled text), so no
 // argument-quoting concern arises from building the command with fmt.Sprintf.
 func writeMarker(kubeconfig, ns, pod, path, content string) error {
-	out, err := runInPod(kubeconfig, ns, pod, "sh", "-c", fmt.Sprintf("printf '%%s' '%s' > '%s'", content, path))
+	out, err := runInWorkspaceContainer(kubeconfig, ns, pod, "sh", "-c", fmt.Sprintf("printf '%%s' '%s' > '%s'", content, path))
 	if err != nil {
 		return fmt.Errorf("write marker %s in %s/%s: %w (output: %s)", path, ns, pod, err, out)
 	}
@@ -87,7 +103,7 @@ func writeMarker(kubeconfig, ns, pod, path, content string) error {
 // as the "absent" signal -- never as "the read succeeded and returned
 // empty", which a shared-volume bug could also produce.
 func readMarker(kubeconfig, ns, pod, path string) (string, error) {
-	out, err := runInPod(kubeconfig, ns, pod, "cat", path)
+	out, err := runInWorkspaceContainer(kubeconfig, ns, pod, "cat", path)
 	if err != nil {
 		return "", fmt.Errorf("read marker %s in %s/%s: %w (output: %s)", path, ns, pod, err, out)
 	}
