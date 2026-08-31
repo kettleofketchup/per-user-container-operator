@@ -241,13 +241,22 @@ EOF
   -f "$KPS_VALUES" \
   --wait --timeout 10m
 
-PROM_CLUSTERIP="$("${KCTL[@]}" -n "$MONITORING_NS" get svc -l app=kube-prometheus-stack-prometheus -o jsonpath='{.items[0].spec.clusterIP}')"
+# ALERTMANAGER_CLUSTERIP is not substituted into anything below (the Go
+# suite resolves it live, by label selector, when it needs it for assertion
+# 2's non-fixture-service probe) -- this is diagnostic only. There is no
+# equivalent PROM_CLUSTERIP any more: the fixtures below select the
+# Prometheus pod by namespace + pod labels (a podSelector+namespaceSelector
+# workspaceEgress peer), not by its Service's ClusterIP -- NetworkPolicy
+# egress evaluates against the POST-DNAT destination, so an ipBlock naming a
+# ClusterIP never matches the packet policy actually evaluates and silently
+# drops every connection to it (see NetworkSpec.WorkspaceEgress's doc
+# comment, api/v1alpha1/peruserapp_types.go, for the full reasoning).
 ALERTMANAGER_CLUSTERIP="$("${KCTL[@]}" -n "$MONITORING_NS" get svc -l app=kube-prometheus-stack-alertmanager -o jsonpath='{.items[0].spec.clusterIP}')"
-if [[ -z "$PROM_CLUSTERIP" || -z "$ALERTMANAGER_CLUSTERIP" ]]; then
-  echo "kind-up.sh: could not resolve Prometheus/Alertmanager ClusterIPs from kube-prometheus-stack" >&2
+if [[ -z "$ALERTMANAGER_CLUSTERIP" ]]; then
+  echo "kind-up.sh: could not resolve the Alertmanager ClusterIP from kube-prometheus-stack" >&2
   exit 1
 fi
-log "Prometheus ClusterIP=$PROM_CLUSTERIP Alertmanager ClusterIP=$ALERTMANAGER_CLUSTERIP"
+log "Alertmanager ClusterIP=$ALERTMANAGER_CLUSTERIP"
 
 # --- StorageClass ---------------------------------------------------------
 # reclaimPolicy: Retain, matching production's ceph-block-static: Task 5's
@@ -430,13 +439,10 @@ spec:
 EOF
 
 # --- Fixture PerUserApps (item 11) -----------------------------------------
-# __WORKSPACE_IMAGE__ / __PROM_CLUSTERIP__ are substituted here because
-# neither value is knowable when the fixture files were written: the
-# workspace image is built above, and the Prometheus ClusterIP does not
-# exist until kube-prometheus-stack is installed.
+# __WORKSPACE_IMAGE__ is substituted here because its value is not knowable
+# when the fixture files were written: the workspace image is built above.
 render_fixture() {
   sed -e "s|__WORKSPACE_IMAGE__|${WORKSPACE_IMG}|g" \
-      -e "s|__PROM_CLUSTERIP__|${PROM_CLUSTERIP}|g" \
       "$1"
 }
 

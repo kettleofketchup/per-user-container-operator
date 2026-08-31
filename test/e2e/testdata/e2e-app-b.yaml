@@ -10,12 +10,10 @@
 # 17 extend this harness with their own CRs rather than standing up their
 # own -- see test/e2e/kind-up.sh's header comment for the full contract.
 #
-# Two placeholders are substituted by kind-up.sh before apply, because
-# neither value is knowable when this file is written:
+# One placeholder is substituted by kind-up.sh before apply, because its
+# value is not knowable when this file is written:
 #   __WORKSPACE_IMAGE__ -- the fixture workspace image kind-up.sh builds and
 #     loads (exported as PUC_E2E_WORKSPACE_IMAGE).
-#   __PROM_CLUSTERIP__  -- the kube-prometheus-stack Prometheus Service's
-#     ClusterIP, read by kind-up.sh after installing that stack.
 apiVersion: apps.kettleofketchup/v1alpha1
 kind: PerUserApp
 metadata:
@@ -46,17 +44,25 @@ spec:
         drop: ["ALL"]
     automountServiceAccountToken: false
   network:
-    # Exactly one ipBlock peer, pinned to a target that is neither a
-    # workspace nor the router: the kube-prometheus-stack Prometheus
-    # Service's ClusterIP. workspaceEgress: [] is legal (spec 137) but would
-    # make the plan's assertion 4 positive half vacuous (DNS-only egress);
-    # the validApp() shape (10.0.0.0/8) would instead cover the pod/node
-    # CIDRs and make assertion 2's CIDR-scoped probes pass for the wrong
-    # reason. See test/e2e/kind-up.sh item 10.
+    # Exactly one peer, pinned to a target that is neither a workspace nor
+    # the router: the kube-prometheus-stack Prometheus pod, selected by
+    # namespace + pod labels rather than by its Service's ClusterIP. See
+    # e2e-app.yaml's identical rule for the full reasoning (NetworkPolicy
+    # egress evaluates against the POST-DNAT destination, so an ipBlock
+    # naming a ClusterIP never matches and silently drops).
+    # workspaceEgress: [] is legal (spec 137) but would make the plan's
+    # assertion 4 positive half vacuous (DNS-only egress); the validApp()
+    # shape (10.0.0.0/8) would instead cover the pod/node CIDRs and make
+    # assertion 2's CIDR-scoped probes pass for the wrong reason. See
+    # test/e2e/kind-up.sh item 10.
     workspaceEgress:
       - to:
-          - ipBlock:
-              cidr: __PROM_CLUSTERIP__/32
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: monitoring
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: prometheus
         ports:
           - protocol: TCP
             port: 9090

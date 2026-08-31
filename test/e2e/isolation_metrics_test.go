@@ -72,22 +72,23 @@ func TestIsolationMetricsScrapedWithNetworkPolicies(t *testing.T) {
 	}
 	t.Log("positive (workspace side) observed passing: DNS resolves with NetworkPolicies applied")
 
-	// NOTE: this probe targets the declared workspaceEgress peer's Service
-	// ClusterIP (exactly what the fixture's spec.network.workspaceEgress
-	// ipBlock names -- test/e2e/testdata/e2e-app.yaml's __PROM_CLUSTERIP__).
-	// It is reported with t.Errorf, not t.Fatalf, deliberately: this was
-	// independently reproduced by hand against this live cluster (bypassing
-	// this test entirely -- see this dispatch's report) and traced to a
-	// systemic issue, not a flake, so the rest of this assertion (the
-	// metrics-scrape checks below, which do not route through a Service
-	// ClusterIP) still has diagnostic value collected in the same run rather
-	// than being cut short by the first failure.
-	egressProbe := probeHTTP(globalEnv.Kubeconfig, ns, podM.Name, fmt.Sprintf("http://%s:9090/", promIP), nil, probeBlockTimeoutSecs)
-	if !egressProbe.Reached {
-		t.Errorf("CONCERN (see dispatch report, not a flake): declared workspaceEgress target (Prometheus ClusterIP %s:9090) unreachable from the workspace pod with NetworkPolicies applied -- reproduced independently by hand against the live pod IP too; Calico's iptables dataplane appears to enforce workload egress NetworkPolicy AFTER kube-proxy's DNAT rewrites the ClusterIP to a backend pod IP, so an ipBlock rule naming a Service's ClusterIP never matches the packet policy actually evaluates", promIP)
-	} else {
-		t.Logf("positive (workspace side) observed passing: declared workspaceEgress target reachable (code %s)", egressProbe.Code)
+	// The fixture's declared workspaceEgress peer selects the Prometheus
+	// POD directly (namespace + pod labels), not its Service's ClusterIP --
+	// see NetworkSpec.WorkspaceEgress's doc comment
+	// (api/v1alpha1/peruserapp_types.go) for why an ipBlock naming a
+	// ClusterIP would silently drop (NetworkPolicy egress evaluates against
+	// the POST-DNAT destination) while a selector peer resolving to the
+	// pod's real IP is evaluated correctly. Probed here at the pod's real
+	// IP:port, mirroring exactly what the policy actually admits.
+	promPodIP, err := getPodIP(ctx, globalClient, "monitoring", "app.kubernetes.io/name=prometheus")
+	if err != nil {
+		t.Fatalf("resolve Prometheus pod IP: %v", err)
 	}
+	egressProbe := probeHTTP(globalEnv.Kubeconfig, ns, podM.Name, fmt.Sprintf("http://%s:9090/", promPodIP), nil, probeBlockTimeoutSecs)
+	if !egressProbe.Reached {
+		t.Fatalf("declared workspaceEgress target (Prometheus pod %s:9090) unreachable from the workspace pod with NetworkPolicies applied", promPodIP)
+	}
+	t.Logf("positive (workspace side) observed passing: declared workspaceEgress target reachable (code %s)", egressProbe.Code)
 
 	// --- Positive: both metrics endpoints are ACTUALLY scraped (up == 1),
 	// not merely discovered, plus a non-zero sample from each binary. ---
@@ -120,21 +121,34 @@ func TestIsolationMetricsScrapedWithNetworkPolicies(t *testing.T) {
 	requireUp(routerUpQuery, 1, 30*time.Second)
 	requireUp(controllerUpQuery, 1, 30*time.Second)
 
+	// Polled, not a single query: a counter's exposed value only updates on
+	// Prometheus's NEXT scrape (up to the 30s scrape interval away), so a
+	// router pod that was recently restarted (e.g. by an earlier run of this
+	// same test's own RED phase, in a full-package run) can have already
+	// reset its in-memory counters to 0 with up==1 already confirmed from a
+	// scrape that predates this test's own cold-start request. A single,
+	// non-retried query observed exactly this race directly on this
+	// cluster.
 	requireNonZeroSample := func(query string) {
 		t.Helper()
-		results, err := promQuery(globalEnv.Kubeconfig, ns, clientPod, promIP, query)
-		if err != nil {
-			t.Fatalf("prometheus query %q: %v", query, err)
-		}
-		found := false
-		for _, r := range results {
-			if r.Value > 0 {
-				found = true
-				break
+		waitCtx, waitCancel := context.WithTimeout(ctx, 40*time.Second)
+		defer waitCancel()
+		var last []promQueryResult
+		err := pollUntil(waitCtx, 5*time.Second, func() (bool, error) {
+			results, err := promQuery(globalEnv.Kubeconfig, ns, clientPod, promIP, query)
+			if err != nil {
+				return false, err
 			}
-		}
-		if !found {
-			t.Fatalf("prometheus query %q returned no series with a non-zero sample (results: %+v)", query, results)
+			last = results
+			for _, r := range results {
+				if r.Value > 0 {
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+		if err != nil {
+			t.Fatalf("prometheus query %q never returned a series with a non-zero sample within 40s: %v (last result: %+v)", query, err, last)
 		}
 	}
 	requireNonZeroSample("puc_controller_leader")

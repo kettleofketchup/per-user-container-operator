@@ -299,6 +299,24 @@ func getServiceClusterIP(ctx context.Context, cs kubernetes.Interface, ns, label
 	return ip, nil
 }
 
+// getPodIP resolves the real pod IP of the single Running pod matching
+// labelSelector in ns -- the address a podSelector/namespaceSelector
+// workspaceEgress peer actually admits, as opposed to a Service's
+// ClusterIP (see NetworkSpec.WorkspaceEgress's doc comment,
+// api/v1alpha1/peruserapp_types.go, for why those are not interchangeable).
+func getPodIP(ctx context.Context, cs kubernetes.Interface, ns, labelSelector string) (string, error) {
+	pods, err := cs.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return "", err
+	}
+	for _, p := range pods.Items {
+		if p.Status.Phase == corev1.PodRunning && p.Status.PodIP != "" {
+			return p.Status.PodIP, nil
+		}
+	}
+	return "", fmt.Errorf("no Running pod with a PodIP in %s matching %q", ns, labelSelector)
+}
+
 // promQueryResult is the minimal shape of Prometheus's /api/v1/query
 // response this package needs: the metric label set and the instant value
 // for each returned series.
