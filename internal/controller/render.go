@@ -662,6 +662,14 @@ func allowedVolumeSource(vs corev1.VolumeSource) bool {
 	return count == 1 && allowed[set]
 }
 
+// isEmptyLabelSelector reports whether sel selects every object of its kind
+// (no matchLabels, no matchExpressions) -- the metav1.LabelSelector{} zero
+// value, which is a legal, meaningful selector distinct from a nil
+// *LabelSelector (the field not being set at all).
+func isEmptyLabelSelector(sel *metav1.LabelSelector) bool {
+	return len(sel.MatchLabels) == 0 && len(sel.MatchExpressions) == 0
+}
+
 // ValidateApp checks a PerUserApp against the invariants that keep one
 // user's container and volume from reaching another's. Every rejection
 // error names the failure mode, not just the offending field, because these
@@ -715,6 +723,22 @@ func ValidateApp(app *v1alpha1.PerUserApp) (warnings []string, err error) {
 		for j, p := range r.To {
 			if p.IPBlock == nil && p.PodSelector == nil && p.NamespaceSelector == nil {
 				return nil, fmt.Errorf("spec.network.workspaceEgress[%d].to[%d]: peer must set one of ipBlock, podSelector or namespaceSelector", i, j)
+			}
+			if p.PodSelector != nil && isEmptyLabelSelector(p.PodSelector) && p.NamespaceSelector == nil {
+				return nil, fmt.Errorf("spec.network.workspaceEgress[%d].to[%d]: podSelector is empty (matches every pod) with no namespaceSelector; in an egress peer this resolves to every pod in the workspace's OWN namespace — every other user's workspace, and the router — not just the intended target", i, j)
+			}
+			if p.NamespaceSelector != nil && isEmptyLabelSelector(p.NamespaceSelector) && (p.PodSelector == nil || isEmptyLabelSelector(p.PodSelector)) {
+				return nil, fmt.Errorf("spec.network.workspaceEgress[%d].to[%d]: namespaceSelector is empty (matches every namespace) and podSelector is absent or also empty; this resolves to every pod in every namespace in the cluster", i, j)
+			}
+			if p.IPBlock != nil && (p.IPBlock.CIDR == "0.0.0.0/0" || p.IPBlock.CIDR == "::/0") {
+				// No `except` list rescues this: ValidateApp is deliberately
+				// client-free (see this function's own doc comment) and has
+				// no access to the controller's actual --pod-cidr value, so
+				// it cannot verify that a claimed except actually carves out
+				// the live pod network rather than some unrelated range that
+				// happens to look plausible. Trusting an unverifiable except
+				// here would be a false sense of safety, not a real one.
+				return nil, fmt.Errorf("spec.network.workspaceEgress[%d].to[%d]: ipBlock.cidr %q allows every address, including every other workspace and the router; an except list is not accepted as a carve-out here because this validator has no access to the actual pod CIDR to confirm it excludes it", i, j, p.IPBlock.CIDR)
 			}
 		}
 	}

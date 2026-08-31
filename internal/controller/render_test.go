@@ -279,6 +279,105 @@ func TestValidateAcceptsSelectorEgressAndRejectsEmptyRouterIngress(t *testing.T)
 	})
 }
 
+// TestValidateRejectsSelectAllWorkspaceEgressPeers: an empty podSelector,
+// namespaceSelector or ipBlock 0.0.0.0/0 (or ::/0) all satisfy "peer sets
+// one of ipBlock/podSelector/namespaceSelector" -- the CEL rule and the
+// check just above both admit them -- but each one silently reaches every
+// other user's workspace and the router, defeating the exact isolation
+// property this operator exists for. This gate has to live here, not in
+// CEL: the CEL cost estimator already prices the nested
+// self.workspaceEgress.all(r, r.to.all(...)) at its budget limit (see
+// NetworkSpec's doc comment, api/v1alpha1/peruserapp_types.go), and any
+// additional condition risks an uninstallable CRD.
+//
+// The two "broad but deliberately targeted" shapes below are legitimate and
+// must stay accepted: an empty podSelector paired with a NON-empty
+// namespaceSelector ("every pod in these namespaces") and a NON-empty
+// podSelector paired with an empty namespaceSelector ("these labelled pods
+// in every namespace"). Rejecting either would be overreach against a
+// normal way to allow egress to a whole namespace or a labelled workload
+// class across namespaces.
+func TestValidateRejectsSelectAllWorkspaceEgressPeers(t *testing.T) {
+	t.Run("empty podSelector alone reaches every pod in the workspace's own namespace", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{}}}},
+		}
+		if _, err := ValidateApp(app); err == nil {
+			t.Fatal("empty podSelector with no namespaceSelector accepted; in an egress peer this is every pod in the workspace's own namespace -- every other user's workspace and the router")
+		}
+	})
+	t.Run("empty namespaceSelector with no podSelector reaches every pod in every namespace", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{NamespaceSelector: &metav1.LabelSelector{}}}},
+		}
+		if _, err := ValidateApp(app); err == nil {
+			t.Fatal("empty namespaceSelector with no podSelector accepted; this is every pod in every namespace in the cluster")
+		}
+	})
+	t.Run("empty namespaceSelector with empty podSelector reaches every pod in every namespace", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{NamespaceSelector: &metav1.LabelSelector{}, PodSelector: &metav1.LabelSelector{}}}},
+		}
+		if _, err := ValidateApp(app); err == nil {
+			t.Fatal("empty namespaceSelector with an also-empty podSelector accepted; this is every pod in every namespace in the cluster")
+		}
+	})
+	t.Run("ipBlock 0.0.0.0/0 reaches everything", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"}}}},
+		}
+		if _, err := ValidateApp(app); err == nil {
+			t.Fatal("ipBlock 0.0.0.0/0 accepted; this reaches every other workspace and the router")
+		}
+	})
+	t.Run("ipBlock ::/0 reaches everything", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "::/0"}}}},
+		}
+		if _, err := ValidateApp(app); err == nil {
+			t.Fatal("ipBlock ::/0 accepted; this reaches every other workspace and the router")
+		}
+	})
+	t.Run("ipBlock 0.0.0.0/0 with an except is still rejected", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0", Except: []string{"10.244.0.0/16"}}}}},
+		}
+		if _, err := ValidateApp(app); err == nil {
+			t.Fatal("ipBlock 0.0.0.0/0 with an except accepted; ValidateApp has no access to the actual pod CIDR to confirm the except excludes it, so an unverifiable except must not rescue this")
+		}
+	})
+	t.Run("empty podSelector with a non-empty namespaceSelector is legitimate and accepted", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{
+				PodSelector:       &metav1.LabelSelector{},
+				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": "monitoring"}},
+			}}},
+		}
+		if _, err := ValidateApp(app); err != nil {
+			t.Fatalf("empty podSelector + non-empty namespaceSelector rejected: %v -- this is a normal way to allow egress to every pod in a specific namespace and must stay accepted", err)
+		}
+	})
+	t.Run("non-empty podSelector with an empty namespaceSelector is legitimate and accepted", func(t *testing.T) {
+		app := validApp()
+		app.Spec.Network.WorkspaceEgress = []networkingv1.NetworkPolicyEgressRule{
+			{To: []networkingv1.NetworkPolicyPeer{{
+				PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "prometheus"}},
+				NamespaceSelector: &metav1.LabelSelector{},
+			}}},
+		}
+		if _, err := ValidateApp(app); err != nil {
+			t.Fatalf("non-empty podSelector + empty namespaceSelector rejected: %v -- this is a normal way to allow egress to a labelled workload class across every namespace and must stay accepted", err)
+		}
+	})
+}
+
 // Warnings, not errors: empty egress is legal (spec 137) and a nested volatile
 // mount is deliberate in workspace-app (spec 670-675).
 func TestValidateWarnsOnEmptyEgressAndNestedVolatileMount(t *testing.T) {
