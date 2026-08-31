@@ -150,11 +150,28 @@ func TestIsolationNetworkProbes(t *testing.T) {
 	// that gap into a clear, attributable failure instead of the whole test
 	// hanging until the outer deadline.
 	restore()
+
+	// The router policy first, on its own, with a generous timeout: this
+	// controller does leader election on top of Deployment readiness
+	// (observed directly elsewhere in this dispatch: ~20-25s from pod Ready
+	// to the first post-election reconcile), so this confirms the self-heal
+	// this test's own comment above claims, rather than relying on evidence
+	// gathered outside this test run.
+	routerPolicyName := smokeApp + "-router"
+	routerWaitCtx, routerWaitCancel := context.WithTimeout(ctx, 60*time.Second)
+	if err := waitNetworkPolicyExists(routerWaitCtx, globalClient, ns, routerPolicyName); err != nil {
+		routerWaitCancel()
+		t.Fatalf("wait for the router NetworkPolicy %s/%s to be reconciled back after restore: %v", ns, routerPolicyName, err)
+	}
+	routerWaitCancel()
+	t.Log("post-restore observed: the router NetworkPolicy was reconciled back (self-heals on every PerUserApp reconcile)")
+
+	workspacePolicies := []string{nameA + "-ingress", nameA + "-egress", nameB + "-ingress", nameB + "-egress"}
 	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer waitCancel()
-	for _, name := range deletedPolicies {
+	for _, name := range workspacePolicies {
 		if err := waitNetworkPolicyExists(waitCtx, globalClient, ns, name); err != nil {
-			t.Fatalf("wait for NetworkPolicy %s/%s to be reconciled back after restore: %v -- if this is one of %v (workspace-scoped), see this test's comment: WorkspaceReconciler has no reconcile path that re-creates a Ready workspace's own NetworkPolicies once deleted, only the router NetworkPolicy self-heals", ns, name, err, []string{nameA + "-ingress", nameA + "-egress", nameB + "-ingress", nameB + "-egress"})
+			t.Fatalf("wait for workspace NetworkPolicy %s/%s to be reconciled back after restore: %v -- WorkspaceReconciler has no reconcile path that re-creates a Ready workspace's own NetworkPolicies once deleted (RenderWorkspaceNetworkPolicies is only ever applied from reconcilePending); only the router NetworkPolicy (just confirmed above) self-heals", ns, name, err)
 		}
 	}
 
