@@ -381,6 +381,14 @@ func kubectlHost(kubeconfig string, args ...string) (string, error) {
 	return string(out), err
 }
 
+// kubectlApplyStdin runs `kubectl apply -f -`, piping yaml on stdin.
+func kubectlApplyStdin(kubeconfig, yaml string) (string, error) {
+	cmd := exec.CommandContext(context.Background(), "kubectl", "--kubeconfig", kubeconfig, "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(yaml)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 // deploymentReplicaCount reads the current desired replica count.
 func deploymentReplicas(ctx context.Context, cs kubernetes.Interface, ns, name string) (int32, error) {
 	dep, err := cs.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})

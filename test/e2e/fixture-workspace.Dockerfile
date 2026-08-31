@@ -21,5 +21,14 @@
 # storage.seed; they exist so a later dispatch's CR can point
 # storage.seed.from at /opt/puc-e2e-seed/samples and land the corpus at
 # <mountPath>/samples/sample.txt after the seed init container's `cp -an`.
+#
+# fixture-workspace-nginx.conf replaces the image's own default.conf to
+# serve from /workspace (the per-user PVC mount, writable by the fixture's
+# pinned uid/fsGroup 101) instead of the image's root-owned
+# /usr/share/nginx/html. Added for task-13b-brief.md assertion 3, which
+# needs an HTTP-observable difference between two workspace pods to prove
+# which one a given routing decision actually reached -- see that file's own
+# doc comment and this dispatch's report.
 FROM nginxinc/nginx-unprivileged:alpine
 COPY fixture-workspace-seed/samples /opt/puc-e2e-seed/samples
+COPY fixture-workspace-nginx.conf /etc/nginx/conf.d/default.conf
