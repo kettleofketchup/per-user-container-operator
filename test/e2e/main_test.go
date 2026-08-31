@@ -30,11 +30,14 @@ import (
 // internal/controller.RenderWorkspacePVC would produce, for the Retain-PV
 // rebind assertion), and invoking kubectl for every such call would
 // make that assertion far harder to get right than the harness's existing
-// primitive of exec'ing curl/sh inside a pod.
+// primitive of exec'ing curl/sh inside a pod. It is built with NewWithWatch
+// (client.WithWatch, a superset of client.Client) because the storage
+// survival assertion needs a live Watch on Workspace objects, not just
+// Get/List, to observe delete events as they happen rather than polling.
 var (
 	globalEnv           e2eEnv
 	globalClient        kubernetes.Interface
-	globalRuntimeClient client.Client
+	globalRuntimeClient client.WithWatch
 )
 
 // TestMain enforces, in this exact order, BEFORE m.Run() is ever called --
@@ -76,7 +79,7 @@ func TestMain(m *testing.M) {
 
 	scheme := clientgoscheme.Scheme
 	utilruntime.Must(v1alpha1.AddToScheme(scheme))
-	rc, err := client.New(cfg, client.Options{Scheme: scheme})
+	rc, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "e2e TestMain: new runtime client:", err)
 		os.Exit(1)
