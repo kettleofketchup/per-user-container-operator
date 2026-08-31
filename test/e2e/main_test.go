@@ -9,16 +9,32 @@ import (
 	"testing"
 	"time"
 
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
 )
 
-// globalEnv and globalClient are set once in TestMain and read by every
-// Test function in this package (this and the assertions a later dispatch
-// adds): one apiserver connection for the whole binary, matching how a real
-// e2e run against either kind or the live edge cluster behaves.
+// globalEnv, globalClient and globalRuntimeClient are set once in TestMain
+// and read by every Test function in this package: one apiserver connection
+// for the whole binary, matching how a real e2e run against either kind or
+// the live edge cluster behaves.
+//
+// globalRuntimeClient is a controller-runtime client (typed for both the
+// core API and this operator's own PerUserApp/Workspace CRDs) -- an
+// extension to Task 13a's harness, which only exposed a plain
+// kubernetes.Interface. Task 13b's assertions need typed Get/Create/Delete
+// on PerUserApp and Workspace objects (e.g. rendering the exact PVC object
+// internal/controller.RenderWorkspacePVC would produce, for the Retain-PV
+// rebind assertion), and invoking kubectl for every such call would
+// make that assertion far harder to get right than the harness's existing
+// primitive of exec'ing curl/sh inside a pod.
 var (
-	globalEnv    e2eEnv
-	globalClient kubernetes.Interface
+	globalEnv           e2eEnv
+	globalClient        kubernetes.Interface
+	globalRuntimeClient client.Client
 )
 
 // TestMain enforces, in this exact order, BEFORE m.Run() is ever called --
@@ -57,6 +73,15 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	globalClient = cs
+
+	scheme := clientgoscheme.Scheme
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+	rc, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "e2e TestMain: new runtime client:", err)
+		os.Exit(1)
+	}
+	globalRuntimeClient = rc
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
