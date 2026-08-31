@@ -1,0 +1,84 @@
+# The E2E harness's own fixture PerUserApp (Task 13 Step 0). Neither
+# consumer CR exists yet (the first is Task 14, the second is Task 17), and
+# the consumer image is private and unreachable from this repo's public CI, so
+# this fixture runs a public, kind-loadable image instead. Task 14 and Task
+# 17 extend this harness with their own CRs rather than standing up their
+# own -- see test/e2e/kind-up.sh's header comment for the full contract.
+#
+# Two placeholders are substituted by kind-up.sh before apply, because
+# neither value is knowable when this file is written:
+#   __WORKSPACE_IMAGE__ -- the fixture workspace image kind-up.sh builds and
+#     loads (exported as PUC_E2E_WORKSPACE_IMAGE).
+#   __PROM_CLUSTERIP__  -- the kube-prometheus-stack Prometheus Service's
+#     ClusterIP, read by kind-up.sh after installing that stack.
+apiVersion: apps.kettleofketchup/v1alpha1
+kind: PerUserApp
+metadata:
+  name: e2e-app
+spec:
+  identity:
+    header: X-User-Id
+    maxLength: 256
+  # Mandatory (ValidateApp refuses an absent callerAuth). The Secret is
+  # created by kind-up.sh in every E2E namespace before this CR is applied.
+  callerAuth:
+    secretRef:
+      name: puc-e2e-router
+      key: api-key
+    header: Authorization
+    scheme: Bearer
+  workspace:
+    image: __WORKSPACE_IMAGE__
+    port: 8080
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 101
+      runAsGroup: 101
+      fsGroup: 101
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+    automountServiceAccountToken: false
+  network:
+    # Exactly one ipBlock peer, pinned to a target that is neither a
+    # workspace nor the router: the kube-prometheus-stack Prometheus
+    # Service's ClusterIP. workspaceEgress: [] is legal (spec 137) but would
+    # make the plan's assertion 4 positive half vacuous (DNS-only egress);
+    # the validApp() shape (10.0.0.0/8) would instead cover the pod/node
+    # CIDRs and make assertion 2's CIDR-scoped probes pass for the wrong
+    # reason. See test/e2e/kind-up.sh item 10.
+    workspaceEgress:
+      - to:
+          - ipBlock:
+              cidr: __PROM_CLUSTERIP__/32
+        ports:
+          - protocol: TCP
+            port: 9090
+    # fromTraefik plus exactly one podSelector peer matching the dedicated
+    # test-client pod kind-up.sh creates in this namespace -- never a peer
+    # that also matches WorkspacePodLabels, which would flip the plan's
+    # assertion 2 probe 2 from a real negative into a policy that never
+    # denied anything. See test/e2e/kind-up.sh item 10a.
+    routerIngress:
+      fromTraefik: true
+      from:
+        - podSelector:
+            matchLabels:
+              puc-e2e/role: client
+  storage:
+    size: 1Gi
+    storageClassName: puc-e2e-retain
+    mountPath: /workspace
+  limits:
+    maxWorkspaces: 50
+    maxConcurrentStarts: 5
+  lifecycle:
+    idleTimeout: 30m
+    startupTimeout: 180s
+    backoffMax: 30m
+    reapInterval: 60s
+    connectionHeartbeatInterval: 450s
+  router:
+    replicas: 1
+    coldStartHoldSeconds: 60
