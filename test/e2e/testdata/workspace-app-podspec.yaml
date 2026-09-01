@@ -1,0 +1,130 @@
+# GOLDEN: the pod spec rendered by the real workspace-app consumer chart, verbatim
+# from `helm template`. This file is the source of truth for what the chart
+# emits TODAY (task-14-brief.md section (a)) -- it is never hand-edited to
+# match examples/workspace-app.yaml or the operator's API. If a render disagrees
+# with this file, the golden is stale and must be re-rendered from the
+# chart, not patched by hand: a hand-written or hand-patched golden makes
+# examples/workspace_app_cr_test.go's expressibility walk compare the design
+# against its own API and prove nothing.
+#
+# Provenance:
+#   Chart:        the consumer chart (private repo)
+#   Chart.yaml:   version 0.1.0, appVersion "v0.3.1"
+#   Image tag:    registry.example.com/workspace-app/workspace-app-web:v0.6.1
+#                 (the image tag is what matters; appVersion lags it and is
+#                 not a source of truth for anything the walk checks)
+#   services commit: 3f4864b1049c219eaeafe4cc39a298932ace6530
+#                 "chore: bump the consumer image 0.4.0.post123 → v0.6.1"
+#                 (2026-08-30T08:29:48-04:00)
+#   services submodule pointer at render time: 20fbef40d294c93af5a461a787f76426d66822c3
+#   Rendered:     2026-08-31, via:
+#                   cd <consumer-chart-dir>
+#                   helm template workspace-app .
+#   Helm:         v4.2.0+g0646808
+#
+# This is spec.template.spec (the Deployment's PodSpec) from that render,
+# dedented to top level. Nothing below this line was written by hand except
+# indentation.
+securityContext:
+  fsGroup: 10001
+  runAsGroup: 10001
+  runAsNonRoot: true
+  runAsUser: 10001
+  seccompProfile:
+    type: Unconfined
+initContainers:
+  - name: render-config
+    image: "registry.example.com/workspace-app/workspace-app-web:v0.6.1"
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo "waiting for litellm master-key to be mirrored..."
+        until [ -s /secret/master-key ]; do
+          echo "  litellm-secret/master-key not present yet; retrying in 5s"
+          sleep 5
+        done
+        mkdir -p /workspace/.app
+        python3 - <<'PY'
+        import pathlib
+        key = pathlib.Path("/secret/master-key").read_text().strip()
+        tmpl = pathlib.Path("/tmp/workspace-app-template/config.yaml").read_text()
+        pathlib.Path("/workspace/.app/config.yaml").write_text(
+            tmpl.replace("__LITELLM_API_KEY__", key)
+        )
+        print("wrote /workspace/.app/config.yaml")
+        PY
+    volumeMounts:
+      - name: workspace
+        # Mounted at /workspace/.app (NOT /workspace) so the shared
+        # init-rendered config travels init->main WITHOUT shadowing the
+        # samples baked into the image at /workspace/samples.
+        mountPath: /workspace/.app
+      - name: config-template
+        mountPath: /tmp/workspace-app-template
+        readOnly: true
+      - name: litellm-secret
+        mountPath: /secret
+        readOnly: true
+containers:
+  - name: workspace-app
+    image: "registry.example.com/workspace-app/workspace-app-web:v0.6.1"
+    imagePullPolicy: IfNotPresent
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: false
+    env:
+      - name: WORKSPACE_APP_PORT
+        value: "7399"
+      - name: WORKSPACE_APP_USE_MOCK_LLM
+        value: "0"
+      - name: WORKSPACE_APP_WORKSPACE_DIR
+        value: /workspace
+      - name: WORKSPACE_APP_PUBLIC_URL
+        value: "https://workspace-app.local.lan"
+    ports:
+      - name: http
+        containerPort: 7399
+        protocol: TCP
+    readinessProbe:
+      httpGet:
+        path: /
+        port: http
+      initialDelaySeconds: 15
+      periodSeconds: 10
+    livenessProbe:
+      httpGet:
+        path: /
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 15
+      failureThreshold: 6   # more lenient than readiness: a transient HTTP
+                            # hiccup must not restart the pod and drop every
+                            # in-process WebSocket session
+    volumeMounts:
+      - name: workspace
+        # Mounted at /workspace/.app (NOT /workspace) so the shared
+        # init-rendered config travels init->main WITHOUT shadowing the
+        # samples baked into the image at /workspace/samples.
+        mountPath: /workspace/.app
+    resources:
+      limits:
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 512Mi
+volumes:
+  - name: workspace
+    emptyDir: {}
+  - name: config-template
+    configMap:
+      name: workspace-app-config-template
+  - name: litellm-secret
+    secret:
+      secretName: litellm-secret
+      optional: true

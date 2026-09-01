@@ -29,3 +29,8 @@ result-*
 # Kubernetes local scratch
 kubeconfig
 *.kubeconfig
+
+# E2E harness scratch (test/e2e/kind-up.sh output)
+test/e2e/.generated-env
+test/e2e/.caller-token
+test/e2e/.kubeconfig

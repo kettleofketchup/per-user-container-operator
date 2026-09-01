@@ -1,0 +1,81 @@
+{{/*
+One controller Role + RoleBinding per entry in .Values.watchNamespaces --
+the SAME list that renders the router Role below, the controller
+Deployment's --watch-namespaces flag, and both ServiceMonitors'
+namespaceSelector.matchNames (Task 12 brief). The controller does not
+discover namespaces at runtime; this range is the only place namespace
+enumeration happens (spec "RBAC -> Namespace enumeration").
+
+The discovery.k8s.io/endpointslices grant here exists for the RBAC
+escalation-prevention check, NOT because the controller reads
+EndpointSlices itself: Kubernetes rejects a RoleBinding create unless the
+creator holds every permission in the referenced Role (or holds `bind`).
+The router Role below carries get/list/watch on endpointslices; without the
+matching grant here, every <app>-router RoleBinding create the controller
+issues at runtime 403s with "attempt to grant extra privileges", and the
+router Deployment runs with an SA that has no binding.
+*/}}
+{{- $root := . -}}
+{{- range .Values.watchNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "puc.name" $root }}
+  namespace: {{ . }}
+  labels:
+    {{- include "puc.controllerPodLabels" $root | nindent 4 }}
+rules:
+  - apiGroups: ["apps.kettleofketchup"]
+    resources: ["peruserapps", "workspaces"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps.kettleofketchup"]
+    resources: ["peruserapps/status", "workspaces/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["apps.kettleofketchup"]
+    resources: ["workspaces/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    # get/list/watch/create/update/patch -- matches cmd/controller.go's
+    # controllerNamespaceChecks exactly (Task 13a found this while standing
+    # the E2E harness up: update/patch were missing here, which never
+    # blocked SA creation itself but DID make the controller's own
+    # RoleBinding informer below fail to establish -- see that comment --
+    # which stalls the manager's entire cache sync and every reconciler
+    # with it. Task 11's probe list is the correct requirement; this Role
+    # had drifted from it, invisibly, because envtest's default client is
+    # not RBAC-constrained the way the chart-rendered Role is).
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    # get/list/watch/create/update/patch -- see the serviceaccounts comment
+    # above. list/watch were the two verbs actually starving the manager:
+    # WorkspaceReconciler/PerUserAppReconciler watch RoleBindings as a child
+    # resource, that watch's initial List 403s under the get/create-only
+    # grant this Role previously carried, and the manager's cache never
+    # finishes syncing -- so NO reconciler ever runs, in any namespace,
+    # with no crash and no obviously-related log line pointing at RBAC.
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+{{- end }}

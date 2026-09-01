@@ -1,0 +1,52 @@
+{{- if .Values.metrics.enabled }}
+{{/*
+Relocated from Task 7 (internal/metrics/metrics_test.go), which could not
+`helm template` a chart that did not exist yet. Task 7 pinned these five
+expressions as data and owns the series they name; this chart owns that
+they actually ship. The Failed-ratio expression sums BOTH sides
+(sum(puc_workspaces{phase="Failed"}) / sum(puc_workspaces)) rather than the
+spec's literal text, which joins on the full label set and can never fire.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "puc.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "puc.monitoringLabels" . | nindent 4 }}
+spec:
+  groups:
+    - name: per-user-container-operator
+      rules:
+        - alert: PUCControllerNotElected
+          expr: sum(puc_controller_leader) != 1
+          for: 60s
+          labels:
+            severity: critical
+          annotations:
+            summary: No per-user-container-operator leader is elected.
+        - alert: PUCReaperStale
+          expr: time() - puc_reaper_last_completion_timestamp_seconds > 900
+          labels:
+            severity: warning
+          annotations:
+            summary: The reaper has not completed a pass in over 15 minutes.
+        - alert: PUCWatchedNamespaceNotReady
+          expr: puc_watched_namespace_ready == 0
+          labels:
+            severity: critical
+          annotations:
+            summary: A watched namespace is missing an RBAC grant the controller needs.
+        - alert: PUCIdentityRejectionRateSustained
+          expr: sum(rate(puc_router_identity_rejected_total[5m])) by (namespace, app) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: A caller has stopped sending a trustworthy identity header.
+        - alert: PUCWorkspaceFailureRatioHigh
+          expr: sum(puc_workspaces{phase="Failed"}) / sum(puc_workspaces) > 0.25
+          labels:
+            severity: warning
+          annotations:
+            summary: More than 25% of workspaces are in phase Failed.
+{{- end }}

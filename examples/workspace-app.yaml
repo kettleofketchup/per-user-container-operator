@@ -1,0 +1,212 @@
+# Example PerUserApp for workspace-app (registry.example.com/workspace-app/workspace-app-web:v0.6.1).
+#
+# See test/e2e/testdata/workspace-app-podspec.yaml for the golden PodSpec this CR
+# was written against (rendered from `helm template` on the real, private
+# consumer chart) and examples/workspace_app_cr_test.go for the checks that keep
+# the two in sync.
+#
+# `spec.storage.size` and `spec.limits` below carry TEST values, marked
+# `# TASK 15` on every affected line. storage.size can never be lowered
+# once set (CEL and the controller both refuse a shrink), so it is only
+# ever set for real once Task 15 measures a cold-start distribution against
+# this task's own e2e test (TestWorkspaceAppColdStart). Everything else here is
+# a real value transcribed from the golden or the operator's design deltas
+# (task-14-brief.md sections (a) and (b)) -- see that file for the full
+# reasoning, in particular why the chart's own `workspace` emptyDir is
+# renamed to `app-scratch` below (it is a 16Mi tmpfs at /workspace/.app,
+# not the persistent workspace -- that is the per-user PVC, mounted at
+# spec.storage.mountPath; keeping the chart's name here would point a
+# reader at the wrong volume).
+#
+# Three values here are harness-only, good for this repo's own E2E run and
+# nothing else: storage.storageClassName, callerAuth.secretRef.name, and
+# the `# TASK 15`-marked sizing above. A real deployment substitutes its
+# own values for all three.
+#
+# storage.storageClassName is this repo's own E2E StorageClass
+# (test/e2e/kind-up.sh); a real deployment substitutes its own
+# Retain-reclaim class (production convention: ceph-block-static).
+apiVersion: apps.kettleofketchup/v1alpha1
+kind: PerUserApp
+metadata:
+  name: workspace-app
+spec:
+  identity:
+    header: X-User-Id
+    maxLength: 256
+  # Mandatory (ValidateApp refuses an absent callerAuth). The Secret is
+  # created by test/e2e/kind-up.sh in every E2E namespace.
+  callerAuth:
+    secretRef:
+      name: puc-e2e-router
+      key: api-key
+    header: Authorization
+    scheme: Bearer
+  workspace:
+    image: registry.example.com/workspace-app/workspace-app-web:v0.6.1
+    imagePullPolicy: IfNotPresent
+    port: 7399
+    env:
+      - name: WORKSPACE_APP_PORT
+        value: "7399"
+      - name: WORKSPACE_APP_USE_MOCK_LLM
+        value: "0"
+      - name: WORKSPACE_APP_WORKSPACE_DIR
+        value: /workspace
+      - name: WORKSPACE_APP_PUBLIC_URL
+        value: "https://workspace-app.local.lan"
+      # DELTA (task-14-brief.md section (b)): not part of the chart's own
+      # render. The seeded corpus and the user's persistent work live under
+      # the per-user PVC (spec.storage.mountPath: /workspace); HOME must
+      # point inside it or the entrypoint's $HOME/.config/app write lands
+      # on the ephemeral pod filesystem instead.
+      - name: HOME
+        value: /workspace/home
+    podSecurityContext:
+      runAsNonRoot: true
+      runAsUser: 10001
+      runAsGroup: 10001
+      fsGroup: 10001
+      seccompProfile:
+        type: Unconfined
+    securityContext:
+      allowPrivilegeEscalation: false
+      # Must stay false: the entrypoint writes $HOME/.config/app.
+      readOnlyRootFilesystem: false
+    automountServiceAccountToken: false
+    readinessProbe:
+      httpGet:
+        path: /
+        port: http
+      initialDelaySeconds: 15
+      periodSeconds: 10
+    # Deliberately more lenient than readiness: a transient HTTP hiccup must
+    # not restart the pod and drop every in-process WebSocket session.
+    livenessProbe:
+      httpGet:
+        path: /
+        port: http
+      initialDelaySeconds: 30
+      periodSeconds: 15
+      failureThreshold: 6
+    volumes:
+      # DELTA (task-14-brief.md section (b)): the chart's own `workspace`
+      # emptyDir, renamed. In a PerUserApp the persistent workspace is the
+      # per-user PVC (spec.storage.mountPath: /workspace); keeping the
+      # chart's name here would point a reader at the wrong volume. It also
+      # diverges from the golden in shape, not just name: the golden's
+      # `workspace` is a disk-backed, unbounded emptyDir: {}, while this one
+      # is a capped 16Mi medium: Memory tmpfs -- a different path from the
+      # PVC's own mount.
+      - name: app-scratch
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Mi
+      # Chart-native (section (a)): the render-config init container's
+      # rendered config.yaml template.
+      - name: config-template
+        configMap:
+          name: workspace-app-config-template
+      # Chart-native (section (a)): the litellm master key mirrored in by
+      # the platform. optional: true matches the chart -- render-config
+      # itself blocks on `until [ -s /secret/master-key ]` until it is
+      # actually populated and non-empty (test/e2e/kind-up.sh creates one
+      # per namespace for this reason).
+      - name: litellm-secret
+        secret:
+          secretName: litellm-secret
+          optional: true
+    volumeMounts:
+      - name: app-scratch
+        mountPath: /workspace/.app
+    # Chart-native (section (a)): the container's own resource requests and
+    # limits, unchanged from the render.
+    resources:
+      limits:
+        memory: 1Gi
+      requests:
+        cpu: 250m
+        memory: 512Mi
+    initContainers:
+      # Chart-native (section (a)): same image, same script, same three
+      # mounts as the golden's render-config init container.
+      - name: render-config
+        image: registry.example.com/workspace-app/workspace-app-web:v0.6.1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+        command:
+          - /bin/sh
+          - -c
+          - |
+            set -e
+            echo "waiting for litellm master-key to be mirrored..."
+            until [ -s /secret/master-key ]; do
+              echo "  litellm-secret/master-key not present yet; retrying in 5s"
+              sleep 5
+            done
+            mkdir -p /workspace/.app
+            python3 - <<'PY'
+            import pathlib
+            key = pathlib.Path("/secret/master-key").read_text().strip()
+            tmpl = pathlib.Path("/tmp/workspace-app-template/config.yaml").read_text()
+            pathlib.Path("/workspace/.app/config.yaml").write_text(
+                tmpl.replace("__LITELLM_API_KEY__", key)
+            )
+            print("wrote /workspace/.app/config.yaml")
+            PY
+        volumeMounts:
+          - name: app-scratch
+            mountPath: /workspace/.app
+          - name: config-template
+            mountPath: /tmp/workspace-app-template
+            readOnly: true
+          - name: litellm-secret
+            mountPath: /secret
+            readOnly: true
+  network:
+    # Exactly one peer, pinned to the kube-prometheus-stack Prometheus pod
+    # by namespace + pod labels (never its Service's ClusterIP -- see
+    # NetworkSpec.WorkspaceEgress's doc comment, api/v1alpha1/peruserapp_types.go).
+    workspaceEgress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: monitoring
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: prometheus
+        ports:
+          - protocol: TCP
+            port: 9090
+    routerIngress:
+      fromTraefik: true
+      from:
+        - podSelector:
+            matchLabels:
+              puc-e2e/role: client
+  storage:
+    size: 1Gi   # TASK 15
+    storageClassName: puc-e2e-retain
+    mountPath: /workspace
+    # DELTA (task-14-brief.md section (b)): the chart has no seed at all.
+    # The seed corpus is staged at /mnt/workspace (never at mountPath --
+    # mounting the claim at mountPath in the seeder would shadow the copy
+    # source and every user would get an empty workspace) and copied from
+    # /workspace/samples, which is baked into the image.
+    seed:
+      stagingMountPath: /mnt/workspace
+      from: /workspace/samples
+  limits:
+    maxWorkspaces: 50           # TASK 15
+    maxConcurrentStarts: 5      # TASK 15
+  lifecycle:
+    idleTimeout: 30m
+    startupTimeout: 180s
+    backoffMax: 30m
+    reapInterval: 60s
+    connectionHeartbeatInterval: 450s
+  router:
+    replicas: 1
+    coldStartHoldSeconds: 60

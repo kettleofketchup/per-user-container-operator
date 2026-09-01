@@ -1,0 +1,32 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+{{/*
+Selects every <app>-router Service in every watched namespace, by the two
+generic labels the controller stamps at runtime (RouterPodLabels, Task 11):
+LabelPartOf=per-user-container-operator and LabelComponent=router.
+
+namespaceSelector.matchNames comes from the SAME .Values.watchNamespaces
+list that renders the Roles above: router Services are created at RUNTIME
+by the controller in the watched namespaces, never in .Release.Namespace,
+so a bare spec.selector with no namespaceSelector -- the house pattern
+copied verbatim -- would default to this ServiceMonitor's own namespace and
+select nothing.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "puc.name" . }}-router
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "puc.monitoringLabels" . | nindent 4 }}
+spec:
+  namespaceSelector:
+    matchNames:
+      {{- toYaml .Values.watchNamespaces | nindent 6 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/part-of: per-user-container-operator
+      puc.kettleofketchup/component: router
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+{{- end }}

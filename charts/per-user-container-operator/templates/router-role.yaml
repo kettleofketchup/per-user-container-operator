@@ -1,0 +1,47 @@
+{{/*
+The router Role, one per served namespace, name == api/v1alpha1.RouterRoleName
+byte-for-byte (Task 11's RenderRouterRoleBinding hardcodes this exact
+roleRef.name; a mismatch is a dangling reference invisible to both tasks'
+suites). Per-namespace rather than per-app because these rules never
+mention an app name -- the controller creates the per-app <app>-router
+ServiceAccount and RoleBinding at runtime (Task 11); this chart cannot know
+app names at render time.
+
+Rules are EXACT here -- nothing else -- because this Role is the artifact
+under test (test/chart/render_test.go's TestRouterRoleRulesExact, and
+test/envtest/workspace_test.go's TestRouterRoleGrantsExactlyWhatTheRouterDoes
+applies this exact rendered Role against a real impersonated client). No
+pods, no secrets, no peruserapps: the router only ever creates/reads
+Workspaces, patches their status, and watches Services + EndpointSlices to
+resolve and invalidate a workspace's address.
+
+`services` carries `watch`, not just get/list: the router's Resolver
+(internal/router/resolve.go) calls client.WithWatch.Watch on Services to
+invalidate its address cache on delete. Without it, a recycled ClusterIP
+silently continues routing to whichever workspace previously held that
+address -- one user's request landing in another user's container.
+*/}}
+{{- $root := . -}}
+{{- range .Values.watchNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "puc.routerRoleName" $root }}
+  namespace: {{ . }}
+  labels:
+    {{- include "puc.controllerPodLabels" $root | nindent 4 }}
+rules:
+  - apiGroups: ["apps.kettleofketchup"]
+    resources: ["workspaces"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["apps.kettleofketchup"]
+    resources: ["workspaces/status"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+{{- end }}
