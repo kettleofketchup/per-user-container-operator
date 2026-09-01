@@ -2,15 +2,15 @@
 
 The durable record of Task 15. Every number a consumer CR freezes is
 recorded here with the app it was measured on and the method used, because
-these are per-`PerUserApp` fields consumed by two different CRs and several
-of them can never be lowered once set.
+these are per-`PerUserApp` fields and several of them can never be lowered
+once set.
 
-Two consumers are covered:
+The consumer covered here is `workspace-app`, the example CR at
+`examples/workspace-app.yaml`. Two of its facets are measured separately,
+because the shape this operator renders and the shape running today diverge:
 
-- **Consumer A — `workspace-app`**, `examples/workspace-app.yaml`. No pre-existing user
-  data.
-- **Consumer B — the second consumer application** (identified in the design
-  spec; referred to generically here). Has existing per-user home
+- **the example CR** — what the operator renders. No pre-existing user data.
+- **the deployed workload** — what runs today. Has existing per-user home
   directories that a migration must preserve.
 
 Status of each step is stated explicitly. An entry marked PENDING is not a
@@ -20,7 +20,7 @@ default to copy — it is a measurement nobody has taken yet.
 
 ## Step 1 — Open WebUI's tool-server client timeout — ANSWERED
 
-**Bounds `router.coldStartHoldSeconds`** (consumer B).
+**Bounds `router.coldStartHoldSeconds`** (the deployed workload).
 
 Measured against Open WebUI **v0.11.1** upstream source (method: reading the
 tool-server client and its timeout configuration, not a live probe — no live
@@ -55,7 +55,7 @@ which is the same version these answers were read against. They apply
 exactly; nothing here is extrapolated across releases.
 
 `examples/workspace-app.yaml` currently sets `router.coldStartHoldSeconds: 60`.
-That is consumer A's value and is not governed by this measurement.
+That is the example CR's own value and is not governed by this measurement.
 
 ---
 
@@ -100,7 +100,7 @@ version this was read against.
 
 ---
 
-## Step 3 — consumer B image identity, id transformation and legacy sizes — ANSWERED
+## Step 3 — deployed image identity, id transformation and legacy sizes — ANSWERED
 
 All of this is read off the **live production deployment** and its database,
 read-only. No production state was modified.
@@ -108,7 +108,7 @@ read-only. No production state was modified.
 ### Container identity
 
 `id` inside the running container: **`uid=1000(user) gid=1000(user)
-groups=1000(user)`**. So consumer B's CR takes `runAsUser: 1000`,
+groups=1000(user)`**. So the CR takes `runAsUser: 1000`,
 `runAsGroup: 1000`, `fsGroup: 1000`. These are numeric, which is what the
 operator's validation requires — the chart refers to the account by name
 only, so the number is written down nowhere else.
@@ -156,12 +156,12 @@ The live container has exactly one home, `/home/user`, at **20K**, owned by
 the single shared account. There are **no per-user homes to size against**,
 because multi-user mode has never run in production.
 
-Consumer B's `storage.size` therefore **cannot** be derived from a per-user
+The `storage.size` therefore **cannot** be derived from a per-user
 `du`, as the plan's Step 3 assumed. It has to come from the budget in
 Step 4 plus a growth assumption, and it must be recorded as such — it can
 never be lowered once set.
 
-`limits.maxWorkspaces` for consumer B is bounded by **8** users today.
+`limits.maxWorkspaces` is bounded by **8** users today.
 
 ## Step 4 — cold-start distribution — HALF ANSWERED, HALF BLOCKED
 
@@ -181,9 +181,9 @@ fixed against — for both consumers together, plus every other RBD claim on
 the cluster. It is a single-node cluster; there is no second failure domain
 to grow into.
 
-Working the constraint backwards for consumer B at 8 users: even a generous
-20 GiB per workspace is 160 GiB, over half the pool, before consumer A takes
-anything. `maxWorkspaces` for consumer B should be set from the real user
+Working the constraint backwards at 8 users: even a generous 20 GiB per
+workspace is 160 GiB, over half the pool, before anything else on the
+cluster claims a byte. `maxWorkspaces` should be set from the real user
 count with headroom (say 16), not from a round number.
 
 ### The cold-start distribution — still PENDING
@@ -202,18 +202,16 @@ there.
 Consequently these remain **unmeasured guesses** and are marked `# TASK 15`
 in `examples/workspace-app.yaml`:
 
-| Field | App | Current value | Status |
-|---|---|---|---|
-| `limits.maxConcurrentStarts` | A | `5` | guess |
-| `storage.size` | A | `1Gi` | test value — **can never be lowered once set** |
-| `limits.maxWorkspaces` | A | `50` | test value — against a 313 GiB pool, `1Gi x 50` fits; a later `storage.size` raise does not |
-| `storage.size` | B | — | not set; **cannot** come from per-user sizes (Step 3: none exist) |
-| `limits.maxWorkspaces` | B | — | not set; bounded by 8 real users today |
+| Field | Current value | Status |
+|---|---|---|
+| `limits.maxConcurrentStarts` | `5` | guess |
+| `storage.size` | `1Gi` | test value — **can never be lowered once set**; **cannot** come from per-user sizes (Step 3: none exist) |
+| `limits.maxWorkspaces` | `50` | test value — against a 313 GiB pool, `1Gi x 50` fits; a later `storage.size` raise does not. Bounded by 8 real users today |
 
 When the step runs, it must record: p50 and p95 of the ten cold starts, the
 derivation from p95 to `maxConcurrentStarts`, and the MAX AVAIL headroom
-above — **per app**. Consumer A's p95 is not consumer B's: the two differ in
-image size, RBD working set and boot cost.
+above. A p95 measured against one image does not carry to another: image
+size, RBD working set and boot cost all differ.
 
 Two invocation constraints for whoever runs it:
 
@@ -226,12 +224,12 @@ Two invocation constraints for whoever runs it:
 
 ---
 
-## Production divergence — what consumer B actually runs today
+## Production divergence — what actually runs today
 
 Recorded because Task 16's migration and Task 17's cutover both assume a
 source that does not exist yet.
 
-The **deployed** consumer B workload is the single-user render: one shared
+The **deployed** workload is the single-user render: one shared
 account, home on an `emptyDir` (not a PVC), multi-user mode not enabled at
 all, image tag `0.12.3`, unchanged for over three months.
 
