@@ -54,8 +54,13 @@ differ. The production instance runs
 which is the same version these answers were read against. They apply
 exactly; nothing here is extrapolated across releases.
 
-`examples/workspace-app.yaml` currently sets `router.coldStartHoldSeconds: 60`.
-That is the example CR's own value and is not governed by this measurement.
+`examples/workspace-app.yaml` sets `router.coldStartHoldSeconds: 60`, and
+since that CR is a transcription of this very workload, this measurement
+governs the value directly. 60 is chosen for the invocation path alone: it
+is deliberately above the 10 s discovery deadline, because a cold start
+during discovery fails it either way and the client retries, while the first
+real tool *call* has no deadline and can wait the start out. It is not an
+attempt to beat the 10 s fetch.
 
 ---
 

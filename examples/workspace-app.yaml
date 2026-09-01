@@ -1,212 +1,200 @@
-# Example PerUserApp for workspace-app (registry.example.com/workspace-app/workspace-app-web:v0.6.1).
+# The worked example: one real consumer, transcribed from its own chart.
 #
-# See test/e2e/testdata/workspace-app-podspec.yaml for the golden PodSpec this CR
-# was written against (rendered from `helm template` on the real, private
-# consumer chart) and examples/workspace_app_cr_test.go for the checks that keep
-# the two in sync.
+# The workload is a per-user command workspace fronted over HTTP. A chat
+# front end calls it as a tool server, forwarding the end user's id in a
+# header; the workspace runs that user's commands and keeps their files.
 #
-# `spec.storage.size` and `spec.limits` below carry TEST values, marked
-# `# TASK 15` on every affected line. storage.size can never be lowered
-# once set (CEL and the controller both refuse a shrink), so it is only
-# ever set for real once Task 15 measures a cold-start distribution against
-# this task's own e2e test (TestWorkspaceAppColdStart). Everything else here is
-# a real value transcribed from the golden or the operator's design deltas
-# (task-14-brief.md sections (a) and (b)) -- see that file for the full
-# reasoning, in particular why the chart's own `workspace` emptyDir is
-# renamed to `app-scratch` below (it is a 16Mi tmpfs at /workspace/.app,
-# not the persistent workspace -- that is the per-user PVC, mounted at
-# spec.storage.mountPath; keeping the chart's name here would point a
-# reader at the wrong volume).
+# WHAT THIS REPLACES. The chart renders ONE Deployment of this image with
+# the app's own in-container multi-user mode switched on: a single process
+# maps each distinct X-User-Id to a Linux account, runs commands under
+# `sudo -u`, and chmods each home 2770. Its own values file is blunt about
+# what that is worth -- privacy between colleagues, not a boundary, since
+# every user shares one kernel, one network namespace and one set of
+# limits -- and blunter still about the failure mode: with the header
+# absent the app silently falls back to the SHARED filesystem. No error,
+# no log line. Zero isolation, looking perfectly healthy.
 #
-# Three values here are harness-only, good for this repo's own E2E run and
-# nothing else: storage.storageClassName, callerAuth.secretRef.name, and
-# the `# TASK 15`-marked sizing above. A real deployment substitutes its
-# own values for all three.
+# It also names the fix: "if the threat model changes the answer is
+# container-per-user, not this flag." That is this operator, and this CR is
+# that answer. Three consequences run through everything below:
 #
-# storage.storageClassName is this repo's own E2E StorageClass
-# (test/e2e/kind-up.sh); a real deployment substitutes its own
-# Retain-reclaim class (production convention: ceph-block-static).
+#   1. WORKSPACE_APP_MULTI_USER is deliberately absent. One container now
+#      serves exactly one user, so the app's own account-mapping is dead
+#      weight -- and its silent shared-filesystem fallback is unreachable,
+#      because there is no shared filesystem left to fall back to.
+#   2. The chart's root `init-home` container is gone. It existed only
+#      because mounting one shared volume at /home shadowed the image's
+#      baked /home/user and broke the entrypoint. Here the per-user claim
+#      mounts AT /home/user and spec.storage.seed populates it from the
+#      image's own skeleton, so nothing runs as root.
+#   3. The shared claim becomes one claim per user, provisioned by the
+#      operator with reclaimPolicy Retain.
+#
+# The pod spec the chart renders today is checked in verbatim at
+# test/e2e/testdata/workspace-app-podspec.yaml, and
+# examples/workspace_app_cr_test.go walks every field of it against this
+# API. Values below that came from measurement rather than from that
+# render cite docs/measurements.md.
 apiVersion: apps.kettleofketchup/v1alpha1
 kind: PerUserApp
 metadata:
   name: workspace-app
+  namespace: workspace-app
 spec:
+  # The header the front end forwards. Its backend populates this from the
+  # authenticated session -- a browser cannot set it (docs/measurements.md
+  # Step 2), which is what makes it usable as an identity at all.
+  #
+  # Production identities are canonical 36-character UUIDs; 64 leaves
+  # headroom without accepting an unbounded header.
   identity:
     header: X-User-Id
-    maxLength: 256
-  # Mandatory (ValidateApp refuses an absent callerAuth). The Secret is
-  # created by test/e2e/kind-up.sh in every E2E namespace.
+    maxLength: 64
+
+  # Mandatory: without it anyone who can open a socket to the router sets
+  # the identity header and becomes any user. This is the same Secret the
+  # chart already generates for the front end to authenticate with, so
+  # adopting the operator needs no new credential.
   callerAuth:
     secretRef:
-      name: puc-e2e-router
+      name: workspace-app-api
       key: api-key
     header: Authorization
     scheme: Bearer
+
   workspace:
-    image: registry.example.com/workspace-app/workspace-app-web:v0.6.1
+    image: registry.example.com/workspace-app/workspace-app:0.12.3
     imagePullPolicy: IfNotPresent
-    port: 7399
+    port: 8000
+
+    # What the router presents upstream after stripping the caller's
+    # credential. The app authenticates its own callers with the same key
+    # it reads from the env var below, so router and workspace share it.
+    upstreamAuth:
+      secretRef:
+        name: workspace-app-api
+        key: api-key
+      header: Authorization
+      scheme: Bearer
+
     env:
-      - name: WORKSPACE_APP_PORT
-        value: "7399"
-      - name: WORKSPACE_APP_USE_MOCK_LLM
-        value: "0"
-      - name: WORKSPACE_APP_WORKSPACE_DIR
-        value: /workspace
-      - name: WORKSPACE_APP_PUBLIC_URL
-        value: "https://workspace-app.local.lan"
-      # DELTA (task-14-brief.md section (b)): not part of the chart's own
-      # render. The seeded corpus and the user's persistent work live under
-      # the per-user PVC (spec.storage.mountPath: /workspace); HOME must
-      # point inside it or the entrypoint's $HOME/.config/app write lands
-      # on the ephemeral pod filesystem instead.
-      - name: HOME
-        value: /workspace/home
+      - name: WORKSPACE_APP_API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: workspace-app-api
+            key: api-key
+      # WORKSPACE_APP_MULTI_USER is NOT set here, on purpose. See the
+      # header: one container per user is what makes it unnecessary.
+
+    # The chart sets no pod securityContext at all -- it leans on the
+    # image's USER directive, which the operator cannot accept, because
+    # runAsNonRoot with a non-numeric USER is a CreateContainerConfigError
+    # for every user of the app. docs/measurements.md Step 3 read the
+    # numbers off the running container (uid=1000(user) gid=1000(user)) so
+    # they could be written down here, which is the only place they exist
+    # as numbers.
     podSecurityContext:
       runAsNonRoot: true
-      runAsUser: 10001
-      runAsGroup: 10001
-      fsGroup: 10001
-      seccompProfile:
-        type: Unconfined
-    securityContext:
-      allowPrivilegeEscalation: false
-      # Must stay false: the entrypoint writes $HOME/.config/app.
-      readOnlyRootFilesystem: false
-    automountServiceAccountToken: false
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+
+    # Both probes, timings included, are the chart's own.
     readinessProbe:
       httpGet:
-        path: /
+        path: /health
         port: http
-      initialDelaySeconds: 15
-      periodSeconds: 10
-    # Deliberately more lenient than readiness: a transient HTTP hiccup must
-    # not restart the pod and drop every in-process WebSocket session.
+      periodSeconds: 5
+      failureThreshold: 3
     livenessProbe:
       httpGet:
-        path: /
+        path: /health
         port: http
-      initialDelaySeconds: 30
-      periodSeconds: 15
-      failureThreshold: 6
-    volumes:
-      # DELTA (task-14-brief.md section (b)): the chart's own `workspace`
-      # emptyDir, renamed. In a PerUserApp the persistent workspace is the
-      # per-user PVC (spec.storage.mountPath: /workspace); keeping the
-      # chart's name here would point a reader at the wrong volume. It also
-      # diverges from the golden in shape, not just name: the golden's
-      # `workspace` is a disk-backed, unbounded emptyDir: {}, while this one
-      # is a capped 16Mi medium: Memory tmpfs -- a different path from the
-      # PVC's own mount.
-      - name: app-scratch
-        emptyDir:
-          medium: Memory
-          sizeLimit: 16Mi
-      # Chart-native (section (a)): the render-config init container's
-      # rendered config.yaml template.
-      - name: config-template
-        configMap:
-          name: workspace-app-config-template
-      # Chart-native (section (a)): the litellm master key mirrored in by
-      # the platform. optional: true matches the chart -- render-config
-      # itself blocks on `until [ -s /secret/master-key ]` until it is
-      # actually populated and non-empty (test/e2e/kind-up.sh creates one
-      # per namespace for this reason).
-      - name: litellm-secret
-        secret:
-          secretName: litellm-secret
-          optional: true
-    volumeMounts:
-      - name: app-scratch
-        mountPath: /workspace/.app
-    # Chart-native (section (a)): the container's own resource requests and
-    # limits, unchanged from the render.
+      periodSeconds: 10
+      failureThreshold: 3
+
+    # Per POD now, where the chart's identical block was per DEPLOYMENT
+    # shared by everyone. Same ceiling, applied per user instead of to the
+    # sum of them: the shared container had no limits between its users at
+    # all, which is half of what "privacy, not a boundary" meant.
     resources:
-      limits:
-        memory: 1Gi
       requests:
-        cpu: 250m
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
         memory: 512Mi
-    initContainers:
-      # Chart-native (section (a)): same image, same script, same three
-      # mounts as the golden's render-config init container.
-      - name: render-config
-        image: registry.example.com/workspace-app/workspace-app-web:v0.6.1
-        imagePullPolicy: IfNotPresent
-        securityContext:
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
-        command:
-          - /bin/sh
-          - -c
-          - |
-            set -e
-            echo "waiting for litellm master-key to be mirrored..."
-            until [ -s /secret/master-key ]; do
-              echo "  litellm-secret/master-key not present yet; retrying in 5s"
-              sleep 5
-            done
-            mkdir -p /workspace/.app
-            python3 - <<'PY'
-            import pathlib
-            key = pathlib.Path("/secret/master-key").read_text().strip()
-            tmpl = pathlib.Path("/tmp/workspace-app-template/config.yaml").read_text()
-            pathlib.Path("/workspace/.app/config.yaml").write_text(
-                tmpl.replace("__LITELLM_API_KEY__", key)
-            )
-            print("wrote /workspace/.app/config.yaml")
-            PY
-        volumeMounts:
-          - name: app-scratch
-            mountPath: /workspace/.app
-          - name: config-template
-            mountPath: /tmp/workspace-app-template
-            readOnly: true
-          - name: litellm-secret
-            mountPath: /secret
-            readOnly: true
+
   network:
-    # Exactly one peer, pinned to the kube-prometheus-stack Prometheus pod
-    # by namespace + pod labels (never its Service's ClusterIP -- see
-    # NetworkSpec.WorkspaceEgress's doc comment, api/v1alpha1/peruserapp_types.go).
-    workspaceEgress:
-      - to:
-          - namespaceSelector:
-              matchLabels:
-                kubernetes.io/metadata.name: monitoring
-            podSelector:
-              matchLabels:
-                app.kubernetes.io/name: prometheus
-        ports:
-          - protocol: TCP
-            port: 9090
+    # Deliberately empty: a workspace runs user-supplied commands, so it
+    # gets DNS and its own router and nothing else. The operator renders
+    # both of those itself. Add a peer here only for something a user's
+    # commands genuinely need -- and select the backing PODS, never a
+    # Service ClusterIP, which NetworkPolicy never matches.
+    workspaceEgress: []
     routerIngress:
-      fromTraefik: true
+      # Only the chat front end may reach the router. Not fromTraefik: no
+      # end user talks to this app directly, so nothing should arrive from
+      # the ingress controller.
       from:
         - podSelector:
             matchLabels:
-              puc-e2e/role: client
+              app.kubernetes.io/name: chat-frontend
+
   storage:
-    size: 1Gi   # TASK 15
-    storageClassName: puc-e2e-retain
-    mountPath: /workspace
-    # DELTA (task-14-brief.md section (b)): the chart has no seed at all.
-    # The seed corpus is staged at /mnt/workspace (never at mountPath --
-    # mounting the claim at mountPath in the seeder would shadow the copy
-    # source and every user would get an empty workspace) and copied from
-    # /workspace/samples, which is baked into the image.
+    # TASK 15: derive from the Step 4 budget plus a growth assumption.
+    # docs/measurements.md Step 3 is explicit that this CANNOT come from a
+    # per-user `du`: multi-user mode has never run in production, so there
+    # are no per-user homes to measure -- the one live home is the 20K
+    # shared one. Whatever lands here can never be lowered afterward.
+    size: 1Gi
+    # Must be a Retain-reclaim class, so a reaped user's files outlive their
+    # workspace; the operator refuses a Delete class outright. This is the
+    # cluster's own Retain class, alongside the two Secret names above the
+    # only values here that name a particular cluster rather than the
+    # workload -- test/e2e/workspace_app_test.go overlays all three to run
+    # this same CR against its kind cluster.
+    storageClassName: ceph-block-static
+
+    # AT /home/user, not at /home. This is the whole of what the chart's
+    # root init container worked around: one claim per user needs no
+    # shadowing of the image's baked home, so the entrypoint's
+    # `mkdir -p "$HOME/.local/bin"` finds what it expects.
+    mountPath: /home/user
+
+    # Populate a fresh claim from the image's own home skeleton, so a new
+    # user starts with the dotfiles the image ships rather than an empty
+    # directory. The trailing `/.` matters: the seeder runs
+    # `cp -an <from> <stagingMountPath>/`, so `/home/user` would nest the
+    # skeleton one level deep at /home/user/user while `/home/user/.`
+    # copies its contents.
     seed:
-      stagingMountPath: /mnt/workspace
-      from: /workspace/samples
+      # Never mountPath -- mounting the claim there would shadow the copy
+      # source and every user would get an empty home.
+      stagingMountPath: /mnt/home
+      from: /home/user/.
+
   limits:
-    maxWorkspaces: 50           # TASK 15
-    maxConcurrentStarts: 5      # TASK 15
+    # TASK 15: the production user table holds 8 users
+    # (docs/measurements.md Step 3), which bounds this from below.
+    maxWorkspaces: 50
+    maxConcurrentStarts: 5
+
   lifecycle:
     idleTimeout: 30m
     startupTimeout: 180s
     backoffMax: 30m
     reapInterval: 60s
     connectionHeartbeatInterval: 450s
+
   router:
     replicas: 1
+    # Measured, not guessed (docs/measurements.md Step 2). The front end
+    # runs two unrelated deadlines against a tool server: fetching its
+    # OpenAPI spec times out at 10 s, while invoking a tool has NO
+    # client-side deadline at all. So a hold longer than 10 s buys nothing
+    # for discovery -- a cold start during discovery will fail it, and the
+    # front end retries -- but it is exactly what lets the first real tool
+    # CALL wait out the start instead of erroring. 60 is chosen for that
+    # second path; it is not an attempt to beat the 10 s one.
     coldStartHoldSeconds: 60

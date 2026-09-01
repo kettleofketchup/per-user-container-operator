@@ -14,7 +14,7 @@
 #
 # The baked seed corpus below exists for Task 14 Step 4, which asserts a
 # first-start workspace has a file at the fixed path
-# /workspace/samples/sample.txt: cp -an <storage.seed.from> <staging>/ over a
+# <storage.mountPath>/samples/sample.txt: cp -an <storage.seed.from> <staging>/ over a
 # source that does not exist succeeds silently and copies nothing, so without
 # this bake the workspace comes up empty and that assertion fails with no
 # diagnostic pointing at the image. This task's own fixture CRs do not set

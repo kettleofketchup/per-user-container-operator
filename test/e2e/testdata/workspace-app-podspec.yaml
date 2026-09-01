@@ -1,4 +1,4 @@
-# GOLDEN: the pod spec rendered by the real workspace-app consumer chart, verbatim
+# GOLDEN: the pod spec rendered by the real workspace-app consumer chart,
 # from `helm template`. This file is the source of truth for what the chart
 # emits TODAY (task-14-brief.md section (a)) -- it is never hand-edited to
 # match examples/workspace-app.yaml or the operator's API. If a render disagrees
@@ -8,123 +8,117 @@
 # against its own API and prove nothing.
 #
 # Provenance:
-#   Chart:        the consumer chart (private repo)
-#   Chart.yaml:   version 0.1.0, appVersion "v0.3.1"
-#   Image tag:    registry.example.com/workspace-app/workspace-app-web:v0.6.1
-#                 (the image tag is what matters; appVersion lags it and is
-#                 not a source of truth for anything the walk checks)
-#   services commit: 3f4864b1049c219eaeafe4cc39a298932ace6530
-#                 "chore: bump the consumer image 0.4.0.post123 → v0.6.1"
-#                 (2026-08-30T08:29:48-04:00)
-#   services submodule pointer at render time: 20fbef40d294c93af5a461a787f76426d66822c3
-#   Rendered:     2026-08-31, via:
+#   Chart:        the consumer chart (private repo), an umbrella chart whose
+#                 workspace-app Deployment template is the subject here
+#   Chart.yaml:   version 1.0.0, appVersion "0.11.1" (the umbrella's own
+#                 appVersion tracks the front end it wraps, not this
+#                 workload; the image tag below is the only version that
+#                 governs anything the walk checks)
+#   Image tag:    0.12.3
+#   services commit: f022206a38a0967efdc0bb2eee611a93e50d5f09
+#                 (2026-09-01T09:13:15-04:00)
+#   Rendered:     2026-09-01, via:
 #                   cd <consumer-chart-dir>
-#                   helm template workspace-app .
+#                   helm template workspace-app . \
+#                     --show-only templates/workspace-app-deployment.yaml
 #   Helm:         v4.2.0+g0646808
+#   Values:       the chart's checked-in defaults, unmodified. Those defaults
+#                 have multiUser: true and persistence.enabled: true, which is
+#                 the shape this operator replaces -- see the CR's header.
+#
+# SANITIZED: this repo is public and its naming policy bans the upstream
+# product's own identifiers. Exactly five mechanical substitutions were
+# applied to the render, and nothing else:
+#
+#   the workload's product name           -> workspace-app
+#   its image reference                   -> registry.example.com/workspace-app/workspace-app
+#   the API-key Secret's name             -> workspace-app-api
+#   the shared claim's name               -> workspace-app-workspaces
+#   its two <PRODUCT>_* env var names     -> WORKSPACE_APP_API_KEY,
+#                                            WORKSPACE_APP_MULTI_USER
+#
+# Structure, ordering, comments, probe timings, resource values, uid handling
+# and the init container's script are the render's own, byte for byte.
 #
 # This is spec.template.spec (the Deployment's PodSpec) from that render,
 # dedented to top level. Nothing below this line was written by hand except
 # indentation.
-securityContext:
-  fsGroup: 10001
-  runAsGroup: 10001
-  runAsNonRoot: true
-  runAsUser: 10001
-  seccompProfile:
-    type: Unconfined
+#
+# NOTE there is no pod-level securityContext: the chart relies on the image's
+# own USER directive, which resolves to uid/gid 1000. That is exactly why
+# examples/workspace-app.yaml writes the number down explicitly -- see
+# docs/measurements.md Step 3, which read it off the running container.
+# Mounting the volume at /home shadows the image's own /home/user, which is
+# the server account's home, its WORKDIR, and on its PATH. Upstream's
+# entrypoint chowns /home/user but never CREATES it, then runs
+# `mkdir -p "$HOME/.local/bin"` under `set -e` — on a fresh root-owned
+# volume that fails and the container dies at boot.
+#
+# Gated on multiUser ALONE, not on persistence: an emptyDir mounted at
+# /home is just as empty as a fresh PVC, so disabling persistence would
+# otherwise reintroduce the same boot failure.
+#
+# This runs the SAME image as root purely to create and chown that
+# directory, so `user` resolves from the image's own /etc/passwd and we
+# never hard-code a uid that a future base-image change could invalidate.
 initContainers:
-  - name: render-config
-    image: "registry.example.com/workspace-app/workspace-app-web:v0.6.1"
+  - name: init-home
+    image: "registry.example.com/workspace-app/workspace-app:0.12.3"
     imagePullPolicy: IfNotPresent
     securityContext:
-      allowPrivilegeEscalation: false
-      readOnlyRootFilesystem: false
+      runAsUser: 0
     command:
-      - /bin/sh
+      - /bin/bash
       - -c
       - |
-        set -e
-        echo "waiting for litellm master-key to be mirrored..."
-        until [ -s /secret/master-key ]; do
-          echo "  litellm-secret/master-key not present yet; retrying in 5s"
-          sleep 5
-        done
-        mkdir -p /workspace/.app
-        python3 - <<'PY'
-        import pathlib
-        key = pathlib.Path("/secret/master-key").read_text().strip()
-        tmpl = pathlib.Path("/tmp/workspace-app-template/config.yaml").read_text()
-        pathlib.Path("/workspace/.app/config.yaml").write_text(
-            tmpl.replace("__LITELLM_API_KEY__", key)
-        )
-        print("wrote /workspace/.app/config.yaml")
-        PY
+        set -euo pipefail
+        mkdir -p /home/user
+        chown user:user /home/user
+        echo "init-home: /home/user ready ($(stat -c '%U:%G %a' /home/user))"
     volumeMounts:
       - name: workspace
-        # Mounted at /workspace/.app (NOT /workspace) so the shared
-        # init-rendered config travels init->main WITHOUT shadowing the
-        # samples baked into the image at /workspace/samples.
-        mountPath: /workspace/.app
-      - name: config-template
-        mountPath: /tmp/workspace-app-template
-        readOnly: true
-      - name: litellm-secret
-        mountPath: /secret
-        readOnly: true
+        mountPath: /home
 containers:
   - name: workspace-app
-    image: "registry.example.com/workspace-app/workspace-app-web:v0.6.1"
+    image: "registry.example.com/workspace-app/workspace-app:0.12.3"
     imagePullPolicy: IfNotPresent
-    securityContext:
-      allowPrivilegeEscalation: false
-      readOnlyRootFilesystem: false
-    env:
-      - name: WORKSPACE_APP_PORT
-        value: "7399"
-      - name: WORKSPACE_APP_USE_MOCK_LLM
-        value: "0"
-      - name: WORKSPACE_APP_WORKSPACE_DIR
-        value: /workspace
-      - name: WORKSPACE_APP_PUBLIC_URL
-        value: "https://workspace-app.local.lan"
     ports:
       - name: http
-        containerPort: 7399
+        containerPort: 8000
         protocol: TCP
-    readinessProbe:
-      httpGet:
-        path: /
-        port: http
-      initialDelaySeconds: 15
-      periodSeconds: 10
-    livenessProbe:
-      httpGet:
-        path: /
-        port: http
-      initialDelaySeconds: 30
-      periodSeconds: 15
-      failureThreshold: 6   # more lenient than readiness: a transient HTTP
-                            # hiccup must not restart the pod and drop every
-                            # in-process WebSocket session
+    env:
+      - name: WORKSPACE_APP_API_KEY
+        valueFrom:
+          secretKeyRef:
+            name: workspace-app-api
+            key: api-key
+      # Maps each X-User-Id to its own Linux account (sudo -u, home 2770).
+      - name: WORKSPACE_APP_MULTI_USER
+        value: "true"
     volumeMounts:
       - name: workspace
-        # Mounted at /workspace/.app (NOT /workspace) so the shared
-        # init-rendered config travels init->main WITHOUT shadowing the
-        # samples baked into the image at /workspace/samples.
-        mountPath: /workspace/.app
+        # Multi-user homes are /home/<user>, so the volume must cover /home.
+        mountPath: /home
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: http
+      periodSeconds: 10
+      failureThreshold: 3
+    readinessProbe:
+      httpGet:
+        path: /health
+        port: http
+      periodSeconds: 5
+      failureThreshold: 3
     resources:
       limits:
-        memory: 1Gi
-      requests:
-        cpu: 250m
+        cpu: 500m
         memory: 512Mi
+      requests:
+        cpu: 100m
+        memory: 128Mi
 volumes:
   - name: workspace
-    emptyDir: {}
-  - name: config-template
-    configMap:
-      name: workspace-app-config-template
-  - name: litellm-secret
-    secret:
-      secretName: litellm-secret
-      optional: true
+    persistentVolumeClaim:
+      claimName: workspace-app-workspaces
