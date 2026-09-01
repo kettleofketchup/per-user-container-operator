@@ -600,12 +600,10 @@ func TestSeederMountsClaimAtStagingPathAndRunsFirst(t *testing.T) {
 	// spec.workspace.initContainers and emits only the seeder satisfies every
 	// other assertion in this test — InitContainers[0] is the seeder, so the
 	// name, staging-mount, image, command and pull-policy checks all pass.
-	// workspace-app's render-config init container is the only thing that writes
-	// /workspace/.app/config.yaml from the mirrored litellm secret, and Task
-	// 14's remaining coverage never reads InitContainers. Worse, dropping it
-	// makes Task 14 Step 4's kind run GREENER: the real render-config blocks on
-	// `until [ -s /secret/master-key ]`, which never resolves on kind, so the
-	// correct rendering is the one that looks broken.
+	// A consumer's own initContainers are the only thing that prepares state
+	// the workload needs before it starts, and no other coverage in this suite
+	// reads InitContainers past index 0 — so a renderer that dropped them
+	// would fail nowhere else.
 	if len(d.Spec.Template.Spec.InitContainers) != 2 {
 		t.Fatalf("InitContainers = %d, want 2; the user's initContainers were dropped", len(d.Spec.Template.Spec.InitContainers))
 	}
@@ -628,11 +626,15 @@ func TestSeederMountsClaimAtStagingPathAndRunsFirst(t *testing.T) {
 	if d.Spec.Template.Spec.InitContainers[0].Image != app.Spec.Workspace.Image {
 		t.Fatal("seeder must run the workspace image; seed.from only exists inside it")
 	}
-	// The corpus keeps its directory name: `cp -an <from> <staging>/`, no
-	// trailing "/.". See Step 3 — the layout is decided there and Task 14
-	// Step 4 asserts the resulting path.
+	// The renderer passes seed.from through verbatim: `cp -an <from>
+	// <staging>/`, appending nothing. Whether the source arrives under its own
+	// directory name or as loose contents is then the CR author's choice, made
+	// by writing a trailing "/." or not (examples/workspace-app.yaml writes
+	// one, to lay a home skeleton at the volume root). A renderer that
+	// appended "/." itself would take that choice away and flatten every
+	// consumer's corpus to the root permanently.
 	if !strings.Contains(strings.Join(d.Spec.Template.Spec.InitContainers[0].Command, " "), "cp -an /workspace/corpus /mnt/ws/") {
-		t.Fatal("seeder command must copy the source DIRECTORY, not its contents; a trailing /. flattens the corpus to the volume root permanently")
+		t.Fatal("seeder command must pass seed.from through verbatim; appending /. takes the layout choice away from the CR and flattens the corpus to the volume root permanently")
 	}
 	// Airgap: the overlay patches imagePullPolicy to Never, and it has to
 	// reach the seeder too. Left at the default, an airgapped node sits in

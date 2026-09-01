@@ -6,13 +6,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -25,53 +25,15 @@ import (
 // workspaceAppName is the name examples/workspace-app.yaml declares (metadata.name).
 const workspaceAppName = "workspace-app"
 
-// workspaceAppConfigTemplateName is the ConfigMap examples/workspace-app.yaml's
-// config-template volume names (transcribed verbatim from the real
-// workspace-app chart's own ConfigMap, test/e2e/testdata/workspace-app-podspec.yaml).
-// In production this ConfigMap is provisioned by whatever deploys workspace-app
-// itself alongside this operator's CR -- this operator only renders the
-// Deployment/Service/NetworkPolicy from spec.workspace and never manages a
-// ConfigMap merely named in spec.workspace.volumes. This harness has no
-// such deployment, so ensureWorkspaceAppConfigTemplate creates one directly with
-// the same content the golden render carries.
-const workspaceAppConfigTemplateName = "workspace-app-config-template"
-
-// workspaceAppConfigTemplateData is copied verbatim from the golden's own
-// ConfigMap (see this package's kind-up.sh testdata and
-// examples/workspace-app.yaml's header for the render command/date). The
-// __LITELLM_API_KEY__ placeholder is exactly what loadWorkspaceAppCRForKind's
-// rewritten render-config command still substitutes.
-const workspaceAppConfigTemplateData = `llm:
-  servers:
-    - name: "litellm"
-      api_base: "http://litellm.litellm.svc:4000/v1"
-      api_key: "__LITELLM_API_KEY__"
-      api_protocol: completions
-      context_size: 120000
-default_persona: "default"
-logging:
-  level: "INFO"
-`
-
-// ensureWorkspaceAppConfigTemplate creates (or replaces) the config-template
-// ConfigMap examples/workspace-app.yaml's render-config init container mounts.
-// Without it the pod never leaves Init: the volume simply fails to mount
-// ("configmap %q not found"), which is exactly what this harness observed
-// before this helper was added.
-func ensureWorkspaceAppConfigTemplate(ctx context.Context, ns string) error {
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: workspaceAppConfigTemplateName, Namespace: ns},
-		Data:       map[string]string{"config.yaml": workspaceAppConfigTemplateData},
-	}
-	if _, err := globalClient.CoreV1().ConfigMaps(ns).Create(ctx, cm, metav1.CreateOptions{}); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			_, err = globalClient.CoreV1().ConfigMaps(ns).Update(ctx, cm, metav1.UpdateOptions{})
-			return err
-		}
-		return err
-	}
-	return nil
-}
+// e2eCallerSecretName/e2eWorkspaceSecretName are the two API-key Secrets
+// test/e2e/kind-up.sh provisions in every E2E namespace. The CR names the
+// consumer's own Secret instead -- deliberately, since "the operator reuses
+// the credential the chart already generates" is one of the things the
+// example is there to say -- so loadWorkspaceAppCRForKind overlays these.
+const (
+	e2eCallerSecretName    = "puc-e2e-router"
+	e2eWorkspaceSecretName = "puc-e2e-workspace"
+)
 
 // workspaceAppFixtureSeedContent is fixture-workspace-seed/samples/sample.txt's
 // content, baked into the kind fixture image
@@ -83,71 +45,72 @@ func ensureWorkspaceAppConfigTemplate(ctx context.Context, ns string) error {
 const workspaceAppFixtureSeedContent = "puc-e2e-seed-fixture"
 
 // workspaceAppFixtureSeedSourcePath is where the kind fixture image bakes its
-// seed corpus (test/e2e/fixture-workspace.Dockerfile), which is NOT the
-// same path examples/workspace-app.yaml's own spec.storage.seed.from names
-// (/workspace/samples -- the real workspace-app image's own baked path). See
-// loadWorkspaceAppCRForKind's doc comment for why this test repoints seed.from
-// at apply time rather than either editing the checked-in CR or the
-// fixture image.
+// seed corpus (test/e2e/fixture-workspace.Dockerfile), which is NOT the path
+// examples/workspace-app.yaml's own spec.storage.seed.from names (/home/user/.
+// -- the real image's own home skeleton). See loadWorkspaceAppCRForKind's doc
+// comment for why this test repoints seed.from at apply time rather than
+// editing either the checked-in CR or the fixture image.
 const workspaceAppFixtureSeedSourcePath = "/opt/puc-e2e-seed/samples"
 
-// workspaceAppSeedDestPath is where the seed corpus lands on the per-user PVC
-// regardless of which of the two source paths above produced it: cp -an
-// SRC DST/ copies SRC into DST under SRC's own basename, and both
-// candidate source directories are named "samples". task-14-brief.md Step
-// 4 requires this EXACT destination path, not merely "contains the seeded
-// samples".
-const workspaceAppSeedDestPath = "/workspace/samples/sample.txt"
+// workspaceAppScratchVolume/-MountPath are a kind-only ephemeral volume, added
+// by loadWorkspaceAppCRForKind. The CR itself declares none: consumer B keeps
+// nothing outside its home, so there is no ephemeral path in the real
+// workload for Half 4's negative control to interrogate. Rather than invent a
+// scratch dir in the checked-in example purely to give this test a subject
+// (which would make the example document machinery its consumer does not
+// have), the harness supplies its own -- and asserts below that the CR really
+// carries no emptyDir, so this stays an overlay and never silently shadows a
+// value the example gained later.
+const (
+	workspaceAppScratchVolume    = "puc-e2e-scratch"
+	workspaceAppScratchMountPath = "/scratch"
+)
 
-// loadWorkspaceAppCRForKind reads examples/workspace-app.yaml and adapts it for this
-// kind harness, exactly the way task-14-brief.md Step 4 requires and one
-// step further it does not spell out but which follows directly from it.
-// Nothing here EVER touches the checked-in file:
+// loadWorkspaceAppCRForKind reads examples/workspace-app.yaml and adapts it for
+// this kind harness, exactly the way task-14-brief.md Step 4 requires.
+// Nothing here EVER touches the checked-in file, and every overlay below
+// names something this CLUSTER has rather than something the design says:
+// the CR carries the real consumer's values, and the substitutions are the
+// price of running it against a public-CI kind cluster instead of the edge.
 //
 //  1. spec.workspace.image AND every spec.workspace.initContainers[].image
 //     are overlaid to PUC_E2E_WORKSPACE_IMAGE (env.WorkspaceImage) -- the
-//     brief's explicit contract. workspace-app's own image
-//     (registry.example.com/workspace-app/workspace-app-web:v0.6.1)
-//     is private and unreachable from this repo's public CI; Task 15 Step 4
-//     runs this same test against the live edge cluster with that image
-//     substituted back in via the identical environment variable.
+//     brief's explicit contract. The consumer's own image is private and
+//     unreachable from this repo's public CI; Task 15 Step 4 runs this same
+//     test against the live edge cluster with that image substituted back in
+//     via the identical environment variable.
 //
-//  2. spec.storage.seed.from is repointed from /workspace/samples (the
-//     real workspace-app image's own baked path) to
-//     workspaceAppFixtureSeedSourcePath (the kind fixture's baked path,
-//     test/e2e/fixture-workspace.Dockerfile) -- a path that exists only
+//  2. spec.workspace.port is overlaid from PUC_E2E_WORKSPACE_PORT when that
+//     variable is set (kind-up.sh sets it; a live-cluster run leaves it
+//     unset and keeps the CR's own port). The substitute image listens where
+//     it listens -- nginx-unprivileged on 8080 -- and the real 8000 is a
+//     property of the consumer's image, not of this CR's design. Left alone,
+//     the workspace pod runs but never passes readiness on a closed port, the
+//     router answers 503 for the whole coldStartHoldSeconds hold, and nothing
+//     in that failure names the port. The probes need no overlay of their
+//     own: they address the port by NAME ("http"), which the renderer assigns
+//     to spec.workspace.port (internal/controller/render.go's
+//     workspacePortName).
+//
+//  3. spec.storage.seed.from is repointed from the consumer image's own home
+//     skeleton to workspaceAppFixtureSeedSourcePath (the kind fixture's baked
+//     path, test/e2e/fixture-workspace.Dockerfile) -- a path that exists only
 //     inside the substitute image, never the real one, so it cannot be a
-//     value examples/workspace-app.yaml itself carries. Not overlaying it would
-//     make the seed init container's `cp -an` run against a source that is
-//     simply absent from the fixture image, and this operator's own seed
+//     value examples/workspace-app.yaml itself carries. Not overlaying it
+//     would make the seed init container's `cp -an` run against a source
+//     simply absent from the fixture image, and this operator's seed
 //     container mounts the PVC only at stagingMountPath -- never at
 //     mountPath -- so there is no path under which the real value would
 //     resolve by coincidence.
 //
-//  3. spec.workspace.port is overlaid from PUC_E2E_WORKSPACE_PORT when that
-//     variable is set (kind-up.sh sets it; a live-cluster run leaves it
-//     unset and keeps the CR's own port). The substitute image listens
-//     where it listens -- nginx-unprivileged on 8080 -- and workspace-app's own
-//     7399 is a property of workspace-app's image, not of this CR's design. Left
-//     alone, the workspace pod runs but never passes readiness on a closed
-//     port, the router answers 503 for the whole coldStartHoldSeconds hold,
-//     and nothing in that failure names the port. The probes need no
-//     overlay of their own: they address the port by NAME ("http"), which
-//     the renderer assigns to spec.workspace.port
-//     (internal/controller/render.go's workspacePortName).
+//  4. spec.storage.storageClassName and the two Secret names under
+//     callerAuth/upstreamAuth are overlaid to what kind-up.sh provisions in
+//     each E2E namespace. The CR names the consumer's own Retain class and
+//     its own API-key Secret, neither of which exists here.
 //
-//  4. The render-config init container's command is rewritten from
-//     workspace-app's own python3 templating step to a functionally identical
-//     `sed` substitution. Verified directly against the fixture's own base
-//     image (`docker run --rm nginxinc/nginx-unprivileged:alpine sh -c
-//     'which python3'` -- not found; `sed` is present), so the real
-//     command would exit 127 under `set -e` and the pod would
-//     Init:CrashLoopBackOff forever on kind. The `until [ -s
-//     /secret/master-key ]` wait is preserved BYTE FOR BYTE: that loop is
-//     exactly what this task's kind-up.sh addition (a non-empty
-//     litellm-secret/master-key Secret per namespace) exists to unblock,
-//     and this test needs to prove that property regardless of which tool
-//     renders the template afterward.
+//  5. A kind-only ephemeral volume (workspaceAppScratchVolume) is appended,
+//     mounted OUTSIDE spec.storage.mountPath, to give Half 4's negative
+//     control a subject. See that constant for why it is not in the CR.
 func loadWorkspaceAppCRForKind(t *testing.T, env e2eEnv, ns string) *v1alpha1.PerUserApp {
 	t.Helper()
 	path := filepath.Join(packageDir(), "..", "..", "examples", "workspace-app.yaml")
@@ -174,29 +137,25 @@ func loadWorkspaceAppCRForKind(t *testing.T, env e2eEnv, ns string) *v1alpha1.Pe
 	} else {
 		t.Fatal("examples/workspace-app.yaml has no spec.storage.seed; this test's seeded-corpus assertion has nothing to check")
 	}
+	app.Spec.Storage.StorageClassName = env.StorageClass
+	app.Spec.CallerAuth.SecretRef.Name = e2eCallerSecretName
+	if up := app.Spec.Workspace.UpstreamAuth; up != nil {
+		up.SecretRef.Name = e2eWorkspaceSecretName
+	}
 
-	var sawRenderConfig bool
-	for i := range app.Spec.Workspace.InitContainers {
-		c := &app.Spec.Workspace.InitContainers[i]
-		if c.Name != "render-config" {
-			continue
+	for _, v := range app.Spec.Workspace.Volumes {
+		if v.EmptyDir != nil {
+			t.Fatalf("examples/workspace-app.yaml now declares an emptyDir volume (%q); Half 4's negative control should interrogate THAT rather than this harness's own %q overlay", v.Name, workspaceAppScratchVolume)
 		}
-		sawRenderConfig = true
-		c.Command = []string{"/bin/sh", "-c", `set -e
-echo "waiting for litellm master-key to be mirrored..."
-until [ -s /secret/master-key ]; do
-  echo "  litellm-secret/master-key not present yet; retrying in 5s"
-  sleep 5
-done
-mkdir -p /workspace/.app
-key="$(cat /secret/master-key)"
-sed "s#__LITELLM_API_KEY__#$key#" /tmp/workspace-app-template/config.yaml > /workspace/.app/config.yaml
-echo "wrote /workspace/.app/config.yaml"
-`}
 	}
-	if !sawRenderConfig {
-		t.Fatal("examples/workspace-app.yaml has no render-config initContainer any more; this test's kind-only command rewrite has nothing to rewrite")
-	}
+	app.Spec.Workspace.Volumes = append(app.Spec.Workspace.Volumes, corev1.Volume{
+		Name:         workspaceAppScratchVolume,
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory}},
+	})
+	app.Spec.Workspace.VolumeMounts = append(app.Spec.Workspace.VolumeMounts, corev1.VolumeMount{
+		Name:      workspaceAppScratchVolume,
+		MountPath: workspaceAppScratchMountPath,
+	})
 
 	return &app
 }
@@ -251,8 +210,8 @@ func forceReap(ctx context.Context, ns, name string, idleTimeout time.Duration) 
 // corpus at the exact fixed path task-14-brief.md names, then forces a reap
 // and asserts all four halves spec 445-448 names, in order: the workspace
 // pod object is gone, the PVC is still Bound, a file written under
-// /workspace before the reap is readable after re-requesting, and a file
-// under /workspace/.app is absent.
+// spec.storage.mountPath before the reap is readable after re-requesting,
+// and a file on the ephemeral scratch volume is absent.
 func TestWorkspaceAppColdStart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -260,15 +219,6 @@ func TestWorkspaceAppColdStart(t *testing.T) {
 	ns := globalEnv.Namespaces[0]
 	clientPod := "puc-e2e-client"
 	nonce := time.Now().UnixNano()
-
-	if err := ensureWorkspaceAppConfigTemplate(ctx, ns); err != nil {
-		t.Fatalf("ensure %s ConfigMap: %v", workspaceAppConfigTemplateName, err)
-	}
-	t.Cleanup(func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanupCancel()
-		_ = globalClient.CoreV1().ConfigMaps(ns).Delete(cleanupCtx, workspaceAppConfigTemplateName, metav1.DeleteOptions{})
-	})
 
 	app := loadWorkspaceAppCRForKind(t, globalEnv, ns)
 	if err := globalRuntimeClient.Create(ctx, app); err != nil {
@@ -317,26 +267,30 @@ func TestWorkspaceAppColdStart(t *testing.T) {
 		t.Fatalf("find primary workspace pod: %v", err)
 	}
 
-	// --- Seeded corpus lands at the exact fixed path, not merely
-	// "somewhere under /workspace". ---
-	got, err := readMarker(globalEnv.Kubeconfig, ns, pod.Name, workspaceAppSeedDestPath)
+	// --- Seeded corpus lands at the exact fixed path, not merely "somewhere
+	// under the mount". The seeder runs `cp -an SRC DST/`, so the fixture's
+	// source directory arrives under its own basename; the destination is
+	// spec.storage.mountPath, read off the CR rather than restated here so a
+	// mountPath change cannot leave this assertion checking a stale path. ---
+	seedDest := path.Join(app.Spec.Storage.MountPath, path.Base(workspaceAppFixtureSeedSourcePath), "sample.txt")
+	got, err := readMarker(globalEnv.Kubeconfig, ns, pod.Name, seedDest)
 	if err != nil {
-		t.Fatalf("read seeded corpus at %s: %v", workspaceAppSeedDestPath, err)
+		t.Fatalf("read seeded corpus at %s: %v", seedDest, err)
 	}
 	if strings.TrimRight(got, "\n") != workspaceAppFixtureSeedContent {
-		t.Fatalf("seeded corpus at %s = %q, want %q", workspaceAppSeedDestPath, got, workspaceAppFixtureSeedContent)
+		t.Fatalf("seeded corpus at %s = %q, want %q", seedDest, got, workspaceAppFixtureSeedContent)
 	}
-	t.Logf("confirmed seeded corpus at %s", workspaceAppSeedDestPath)
+	t.Logf("confirmed seeded corpus at %s", seedDest)
 
 	// --- Positive controls for the reap assertions below: write one marker
-	// on the persistent volume (expected to survive the reap) and one under
-	// the ephemeral .app scratch volume (expected NOT to survive it), and
-	// read each back before trusting anything about what happens to them. ---
+	// on the persistent volume (expected to survive the reap) and one on the
+	// ephemeral scratch volume (expected NOT to survive it), and read each
+	// back before trusting anything about what happens to them. ---
+	persistentMarker := path.Join(app.Spec.Storage.MountPath, "reap-marker")
+	scratchMarker := path.Join(workspaceAppScratchMountPath, "reap-marker")
 	const (
-		persistentMarker = "/workspace/reap-marker"
-		persistentValue  = "reap-survivor"
-		scratchMarker       = "/workspace/.app/reap-marker"
-		scratchValue        = "reap-casualty"
+		persistentValue = "reap-survivor"
+		scratchValue    = "reap-casualty"
 	)
 	if err := writeMarker(globalEnv.Kubeconfig, ns, pod.Name, persistentMarker, persistentValue); err != nil {
 		t.Fatalf("write persistent marker: %v", err)
@@ -345,10 +299,10 @@ func TestWorkspaceAppColdStart(t *testing.T) {
 		t.Fatalf("POSITIVE CONTROL FAILED: could not read back persistent marker (got %q, err %v)", got, err)
 	}
 	if err := writeMarker(globalEnv.Kubeconfig, ns, pod.Name, scratchMarker, scratchValue); err != nil {
-		t.Fatalf("write .app marker: %v", err)
+		t.Fatalf("write scratch marker: %v", err)
 	}
 	if got, err := readMarker(globalEnv.Kubeconfig, ns, pod.Name, scratchMarker); err != nil || got != scratchValue {
-		t.Fatalf("POSITIVE CONTROL FAILED: could not read back .app marker (got %q, err %v)", got, err)
+		t.Fatalf("POSITIVE CONTROL FAILED: could not read back scratch marker (got %q, err %v)", got, err)
 	}
 	t.Log("positive control observed passing: both markers written and read back before the forced reap")
 
@@ -407,17 +361,17 @@ func TestWorkspaceAppColdStart(t *testing.T) {
 		t.Fatalf("find re-woken workspace pod: %v", err)
 	}
 
-	// --- Half 3: a file written under /workspace before the reap is
-	// readable after re-requesting. ---
+	// --- Half 3: a file written under spec.storage.mountPath before the reap
+	// is readable after re-requesting. ---
 	if got, err := readMarker(globalEnv.Kubeconfig, ns, newPod.Name, persistentMarker); err != nil || got != persistentValue {
 		t.Fatalf("persistent marker did not survive reap+re-request (got %q, err %v)", got, err)
 	}
 	t.Log("confirmed: persistent marker survived reap+re-request")
 
-	// --- Half 4: a file under /workspace/.app is absent -- it is an
+	// --- Half 4: a file on the ephemeral scratch volume is absent -- it is an
 	// emptyDir, recreated empty with the new pod. ---
 	if got, err := readMarker(globalEnv.Kubeconfig, ns, newPod.Name, scratchMarker); err == nil {
-		t.Fatalf(".app marker survived reap+re-request (got %q), want it absent: the emptyDir did not get a fresh volume", got)
+		t.Fatalf("scratch marker survived reap+re-request (got %q), want it absent: the emptyDir did not get a fresh volume", got)
 	}
-	t.Log("confirmed: .app marker is absent after reap+re-request (fresh emptyDir)")
+	t.Log("confirmed: scratch marker is absent after reap+re-request (fresh emptyDir)")
 }

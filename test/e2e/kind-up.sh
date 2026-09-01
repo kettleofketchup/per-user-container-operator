@@ -78,14 +78,6 @@ WORKSPACE_IMG=puc-e2e-workspace:e2e
 WORKSPACE_PORT=8080
 CALLER_TOKEN_VALUE=puc-e2e-caller-token-fixed
 WORKSPACE_TOKEN_VALUE=puc-e2e-workspace-token-fixed
-# Task 14: workspace-app's real render-config init container mounts a
-# `litellm-secret` Secret with `optional: true` and blocks forever on
-# `until [ -s /secret/master-key ]` until it exists AND is non-empty. This
-# harness has no real LiteLLM to mirror a key from, so a fixed, non-empty
-# value is created directly below -- see this script's "Credential Secrets"
-# section.
-LITELLM_MASTER_KEY_VALUE=puc-e2e-litellm-master-key-fixed
-
 KUBECONFIG_PATH="${SCRIPT_DIR}/.kubeconfig"
 ENV_FILE="${SCRIPT_DIR}/.generated-env"
 CALLER_TOKEN_FILE="${SCRIPT_DIR}/.caller-token"
@@ -322,13 +314,6 @@ for ns in "$NS1" "$NS2"; do
     --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
   "${KCTL[@]}" -n "$ns" create secret generic puc-e2e-workspace \
     --from-literal=api-key="$WORKSPACE_TOKEN_VALUE" \
-    --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
-  # Task 14: see LITELLM_MASTER_KEY_VALUE's own comment above. The key name
-  # (master-key) and Secret name (litellm-secret) match what
-  # examples/workspace-app.yaml's spec.workspace.volumes names, which is itself
-  # transcribed verbatim from the real workspace-app chart's Secret volume.
-  "${KCTL[@]}" -n "$ns" create secret generic litellm-secret \
-    --from-literal=master-key="$LITELLM_MASTER_KEY_VALUE" \
     --dry-run=client -o yaml | "${KCTL[@]}" apply -f -
 done
 

@@ -20,7 +20,6 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/yaml"
 
 	"github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
@@ -276,11 +275,41 @@ func walkPodSpec(t *testing.T, spec corev1.PodSpec) []string {
 	// emptyDir is expressible because emptyDir is on the volume allowlist"
 	// (task-14-brief.md Step 3's own reasoning) a fact about production
 	// code, not this test's opinion of it.
-	if len(spec.Volumes) > 0 {
+	//
+	// A persistentVolumeClaim volume is the one source that is expressible
+	// WITHOUT being on that allowlist, because spec.workspace.volumes is
+	// not where it is expressed: the golden's single shared claim is
+	// precisely what this operator replaces with a per-user claim of its
+	// own, declared under spec.storage and rendered by the operator rather
+	// than named by the CR. Feeding it to ValidateApp would report the
+	// design's central move as an inexpressible field. It is partitioned
+	// out here and checked against spec.storage instead.
+	var workspaceVols []corev1.Volume
+	var claimVols []string
+	for _, v := range spec.Volumes {
+		if v.PersistentVolumeClaim != nil {
+			claimVols = append(claimVols, v.Name)
+			continue
+		}
+		workspaceVols = append(workspaceVols, v)
+	}
+	if len(workspaceVols) > 0 {
 		probe := testfixtures.ValidApp()
-		probe.Spec.Workspace.Volumes = spec.Volumes
+		probe.Spec.Workspace.Volumes = workspaceVols
 		if _, err := controller.ValidateApp(probe); err != nil {
 			bad = append(bad, fmt.Sprintf("spec.template.spec.Volumes: %v", err))
+		}
+	}
+	if len(claimVols) > 0 {
+		// Assert the claim really is expressible where this walk claims it
+		// is, against the live type rather than this file's belief about
+		// it: a rename or removal of these fields must fail the walk, not
+		// be papered over by the partition above.
+		st := reflect.TypeOf(v1alpha1.StorageSpec{})
+		for _, want := range []string{"Size", "StorageClassName", "MountPath"} {
+			if _, ok := st.FieldByName(want); !ok {
+				t.Fatalf("internal test error: golden volume(s) %v were treated as expressible via spec.storage, but v1alpha1.StorageSpec has no %s field", claimVols, want)
+			}
 		}
 	}
 
@@ -296,134 +325,184 @@ func walkPodSpec(t *testing.T, spec corev1.PodSpec) []string {
 func TestWorkspaceAppGoldenPodSpecIsExpressible(t *testing.T) {
 	golden := loadGoldenPodSpec(t)
 	goldenPath := filepath.Join(packageDir(), "..", "test", "e2e", "testdata", "workspace-app-podspec.yaml")
-	if len(golden.Containers) < 1 || len(golden.InitContainers) < 1 || len(golden.Volumes) < 3 {
-		t.Fatalf("golden PodSpec %s parsed to %d container(s), %d init container(s), %d volume(s) -- want at least 1, 1, 3 (truncated or wrongly-parsed fixture?)", goldenPath, len(golden.Containers), len(golden.InitContainers), len(golden.Volumes))
+	if len(golden.Containers) < 1 || len(golden.InitContainers) < 1 || len(golden.Volumes) < 1 {
+		t.Fatalf("golden PodSpec %s parsed to %d container(s), %d init container(s), %d volume(s) -- want at least 1, 1, 1 (truncated or wrongly-parsed fixture?)", goldenPath, len(golden.Containers), len(golden.InitContainers), len(golden.Volumes))
 	}
 	if bad := walkPodSpec(t, golden); len(bad) > 0 {
 		t.Fatalf("golden PodSpec has %d field(s) not expressible via spec.workspace or a CR value:\n  %s", len(bad), strings.Join(bad, "\n  "))
 	}
 }
 
-// TestWorkspaceAppCRAssertions is task-14-brief.md Step 3's "assertions the walk
-// cannot make": the expressibility walk above proves a value like an
-// emptyDir volume or a mounted Secret CAN be expressed, never that
-// examples/workspace-app.yaml actually expresses it. These four checks close that
-// gap directly against the checked-in CR.
+// TestWorkspaceAppCRAssertions is task-14-brief.md Step 3's "assertions the
+// walk cannot make": the expressibility walk above proves the golden's shape
+// CAN be expressed, never that examples/workspace-app.yaml actually expresses
+// it -- and never that it makes the substitutions the CR's header claims to
+// make. Each subtest below pins one of those claims against the checked-in
+// CR, so a later edit that quietly reverts one fails here rather than in a
+// cluster.
 func TestWorkspaceAppCRAssertions(t *testing.T) {
 	app := loadWorkspaceAppCR(t)
+	golden := loadGoldenPodSpec(t)
 
 	t.Run("StorageMountPath", func(t *testing.T) {
-		if got := app.Spec.Storage.MountPath; got != "/workspace" {
-			t.Fatalf("spec.storage.mountPath = %q, want /workspace", got)
+		// The chart mounts its shared claim at /home, which shadows the
+		// image's baked /home/user and is the entire reason it needs a root
+		// init container. One claim per user mounts a level deeper and needs
+		// no such workaround, so this path is load-bearing, not cosmetic.
+		if got := app.Spec.Storage.MountPath; got != "/home/user" {
+			t.Fatalf("spec.storage.mountPath = %q, want /home/user", got)
+		}
+		for _, m := range golden.Containers[0].VolumeMounts {
+			if m.MountPath == app.Spec.Storage.MountPath {
+				t.Fatalf("spec.storage.mountPath = %q is the chart's own shared mount point; the per-user claim must mount below it, not shadow the image's home the same way", m.MountPath)
+			}
 		}
 	})
 
 	t.Run("Seed", func(t *testing.T) {
 		seed := app.Spec.Storage.Seed
 		if seed == nil {
-			t.Fatal("spec.storage.seed is nil")
+			t.Fatal("spec.storage.seed is nil -- it is what replaces the chart's root init-home container")
 		}
-		if seed.StagingMountPath != "/mnt/workspace" {
-			t.Fatalf("spec.storage.seed.stagingMountPath = %q, want /mnt/workspace", seed.StagingMountPath)
+		if seed.StagingMountPath != "/mnt/home" {
+			t.Fatalf("spec.storage.seed.stagingMountPath = %q, want /mnt/home", seed.StagingMountPath)
 		}
-		if seed.From != "/workspace/samples" {
-			t.Fatalf("spec.storage.seed.from = %q, want /workspace/samples", seed.From)
+		if seed.StagingMountPath == app.Spec.Storage.MountPath {
+			t.Fatalf("spec.storage.seed.stagingMountPath = %q is the claim's own mountPath -- mounting there shadows the copy source and every user gets an empty home", seed.StagingMountPath)
+		}
+		// The seeder runs `cp -an <from> <staging>/`, so a bare directory
+		// nests one level deep (/home/user/user); the trailing /. copies the
+		// skeleton's CONTENTS. Getting this wrong is silent: the pod starts
+		// and the home is merely wrong.
+		if seed.From != "/home/user/." {
+			t.Fatalf("spec.storage.seed.from = %q, want /home/user/. (the trailing /. copies the skeleton's contents rather than nesting it)", seed.From)
 		}
 	})
 
-	t.Run("HomeEnv", func(t *testing.T) {
-		for _, e := range app.Spec.Workspace.Env {
-			if e.Name == "HOME" && e.Value == "/workspace/home" {
-				return
+	t.Run("MultiUserEnvAbsent", func(t *testing.T) {
+		// The claim the CR's header makes: container-per-user removes the
+		// need for the app's in-container multi-user mode, whose documented
+		// failure mode is falling back to the SHARED filesystem, silently,
+		// when the identity header is absent. Find the env var the golden
+		// sets rather than naming it here, so a rename in the chart cannot
+		// make this check quietly vacuous.
+		var multiUser string
+		for _, e := range golden.Containers[0].Env {
+			if strings.HasSuffix(e.Name, "_MULTI_USER") {
+				multiUser = e.Name
 			}
 		}
-		t.Fatalf("spec.workspace.env does not contain HOME=/workspace/home (env=%+v)", app.Spec.Workspace.Env)
+		if multiUser == "" {
+			t.Fatal("golden container sets no *_MULTI_USER env var -- the chart's shape changed and this assertion no longer means anything")
+		}
+		for _, e := range app.Spec.Workspace.Env {
+			if e.Name == multiUser {
+				t.Fatalf("spec.workspace.env sets %s -- container-per-user makes the app's own account mapping dead weight; see the CR's header", multiUser)
+			}
+		}
+	})
+
+	t.Run("NoRootInitContainer", func(t *testing.T) {
+		// The chart runs init-home as uid 0 only to create and chown the
+		// directory its own mount shadowed. spec.storage.seed does that job
+		// without root, so nothing here may ask for it back.
+		for _, c := range app.Spec.Workspace.InitContainers {
+			sc := c.SecurityContext
+			if sc != nil && sc.RunAsUser != nil && *sc.RunAsUser == 0 {
+				t.Fatalf("initContainer %q runs as uid 0; spec.storage.seed exists precisely so the chart's root init-home container is unnecessary", c.Name)
+			}
+		}
+	})
+
+	t.Run("PortMatchesChart", func(t *testing.T) {
+		ports := golden.Containers[0].Ports
+		if len(ports) != 1 {
+			t.Fatalf("golden container has %d ports, want exactly 1", len(ports))
+		}
+		if want, got := ports[0].ContainerPort, app.Spec.Workspace.Port; got != want {
+			t.Fatalf("spec.workspace.port = %d, want %d (the chart's own containerPort)", got, want)
+		}
 	})
 
 	t.Run("Resources", func(t *testing.T) {
-		res := app.Spec.Workspace.Resources
-		if want, got := resource.MustParse("1Gi"), res.Limits[corev1.ResourceMemory]; got.Cmp(want) != 0 {
-			t.Fatalf("spec.workspace.resources.limits.memory = %s, want %s", got.String(), want.String())
-		}
-		if want, got := resource.MustParse("250m"), res.Requests[corev1.ResourceCPU]; got.Cmp(want) != 0 {
-			t.Fatalf("spec.workspace.resources.requests.cpu = %s, want %s", got.String(), want.String())
-		}
-		if want, got := resource.MustParse("512Mi"), res.Requests[corev1.ResourceMemory]; got.Cmp(want) != 0 {
-			t.Fatalf("spec.workspace.resources.requests.memory = %s, want %s", got.String(), want.String())
+		// Transcribed from the chart, which applies these per DEPLOYMENT
+		// shared by everyone; the CR applies the same numbers per POD. Read
+		// them off the golden rather than repeating literals, so a chart
+		// change surfaces as a mismatch here.
+		want := golden.Containers[0].Resources
+		got := app.Spec.Workspace.Resources
+		for _, k := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			w, g := want.Requests[k], got.Requests[k]
+			if g.Cmp(w) != 0 {
+				t.Errorf("spec.workspace.resources.requests.%s = %s, want %s (the chart's own)", k, g.String(), w.String())
+			}
+			w, g = want.Limits[k], got.Limits[k]
+			if g.Cmp(w) != 0 {
+				t.Errorf("spec.workspace.resources.limits.%s = %s, want %s (the chart's own)", k, g.String(), w.String())
+			}
 		}
 	})
 
-	t.Run("ScratchVolume", func(t *testing.T) {
-		var scratchVol *corev1.Volume
-		for i := range app.Spec.Workspace.Volumes {
-			v := &app.Spec.Workspace.Volumes[i]
+	t.Run("Probes", func(t *testing.T) {
+		// Both probes and their timings are the chart's; the CR is a
+		// transcription, so any divergence is a transcription error.
+		for _, tc := range []struct {
+			name      string
+			want, got *corev1.Probe
+		}{
+			{"readinessProbe", golden.Containers[0].ReadinessProbe, app.Spec.Workspace.ReadinessProbe},
+			{"livenessProbe", golden.Containers[0].LivenessProbe, app.Spec.Workspace.LivenessProbe},
+		} {
+			if tc.want == nil {
+				t.Fatalf("golden container has no %s -- the chart's shape changed", tc.name)
+			}
+			if tc.got == nil {
+				t.Errorf("spec.workspace.%s is nil, want the chart's own", tc.name)
+				continue
+			}
+			if !reflect.DeepEqual(tc.want, tc.got) {
+				t.Errorf("spec.workspace.%s = %+v, want the chart's own %+v", tc.name, tc.got, tc.want)
+			}
+		}
+	})
+
+	t.Run("PodSecurityContext", func(t *testing.T) {
+		// The chart sets NO pod securityContext -- it leans on the image's
+		// USER directive, which the operator cannot accept, because
+		// runAsNonRoot with a non-numeric USER is a CreateContainerConfigError
+		// for every user of the app. docs/measurements.md Step 3 read the
+		// numbers off the running container so they could be written down
+		// here; this is the only place they exist as numbers.
+		if golden.SecurityContext != nil {
+			t.Fatalf("golden PodSpec now HAS a securityContext (%+v) -- the CR's explicit uid/gid no longer stand in for the image's USER directive and should be re-derived from the chart", golden.SecurityContext)
+		}
+		psc := app.Spec.Workspace.PodSecurityContext
+		if psc.RunAsNonRoot == nil || !*psc.RunAsNonRoot {
+			t.Errorf("spec.workspace.podSecurityContext.runAsNonRoot = %v, want true", psc.RunAsNonRoot)
+		}
+		for _, tc := range []struct {
+			name string
+			got  *int64
+		}{
+			{"runAsUser", psc.RunAsUser},
+			{"runAsGroup", psc.RunAsGroup},
+			{"fsGroup", psc.FSGroup},
+		} {
+			if tc.got == nil {
+				t.Errorf("spec.workspace.podSecurityContext.%s is nil, want 1000 (measured: uid=1000(user) gid=1000(user))", tc.name)
+				continue
+			}
+			if *tc.got != 1000 {
+				t.Errorf("spec.workspace.podSecurityContext.%s = %d, want 1000 (measured: uid=1000(user) gid=1000(user))", tc.name, *tc.got)
+			}
+		}
+	})
+
+	t.Run("ReservedPVCVolumeName", func(t *testing.T) {
+		for _, v := range app.Spec.Workspace.Volumes {
 			if v.Name == v1alpha1.PVCVolumeName {
 				t.Fatalf("spec.workspace.volumes declares a volume literally named %q, the operator's reserved per-user PVC volume name -- ValidateApp rejects any user volume that reuses it", v1alpha1.PVCVolumeName)
 			}
-			if v.EmptyDir != nil {
-				scratchVol = v
-			}
-		}
-		if scratchVol == nil {
-			t.Fatal("spec.workspace.volumes has no emptyDir volume for the .app scratch dir")
-		}
-		if scratchVol.EmptyDir.Medium != corev1.StorageMediumMemory {
-			t.Fatalf("volume %q emptyDir.medium = %q, want Memory", scratchVol.Name, scratchVol.EmptyDir.Medium)
-		}
-		if scratchVol.EmptyDir.SizeLimit == nil || scratchVol.EmptyDir.SizeLimit.String() != "16Mi" {
-			t.Fatalf("volume %q emptyDir.sizeLimit = %v, want 16Mi", scratchVol.Name, scratchVol.EmptyDir.SizeLimit)
-		}
-
-		var mounted bool
-		for _, m := range app.Spec.Workspace.VolumeMounts {
-			if m.Name == scratchVol.Name && m.MountPath == "/workspace/.app" {
-				mounted = true
-			}
-		}
-		if !mounted {
-			t.Fatalf("spec.workspace.volumeMounts does not mount volume %q at /workspace/.app", scratchVol.Name)
-		}
-	})
-
-	t.Run("RenderConfigInitContainerMounts", func(t *testing.T) {
-		var haveConfigTemplate, haveLitellmSecret bool
-		var configTemplateName, litellmSecretName string
-		for _, v := range app.Spec.Workspace.Volumes {
-			if v.ConfigMap != nil {
-				haveConfigTemplate = true
-				configTemplateName = v.Name
-			}
-			if v.Secret != nil {
-				haveLitellmSecret = true
-				litellmSecretName = v.Name
-			}
-		}
-		if !haveConfigTemplate {
-			t.Fatal("spec.workspace.volumes has no configMap-sourced volume (config-template)")
-		}
-		if !haveLitellmSecret {
-			t.Fatal("spec.workspace.volumes has no secret-sourced volume (litellm-secret)")
-		}
-
-		var initC *corev1.Container
-		for i := range app.Spec.Workspace.InitContainers {
-			if app.Spec.Workspace.InitContainers[i].Name == "render-config" {
-				initC = &app.Spec.Workspace.InitContainers[i]
-			}
-		}
-		if initC == nil {
-			t.Fatal("spec.workspace.initContainers has no render-config container")
-		}
-
-		mountedAt := map[string]string{}
-		for _, m := range initC.VolumeMounts {
-			mountedAt[m.Name] = m.MountPath
-		}
-		if got := mountedAt[configTemplateName]; got != "/tmp/workspace-app-template" {
-			t.Fatalf("render-config mounts %q at %q, want /tmp/workspace-app-template", configTemplateName, got)
-		}
-		if got := mountedAt[litellmSecretName]; got != "/secret" {
-			t.Fatalf("render-config mounts %q at %q, want /secret", litellmSecretName, got)
 		}
 	})
 
@@ -438,11 +517,11 @@ func TestWorkspaceAppCRAssertions(t *testing.T) {
 // task-14-brief.md's Step 3 requires (spec 697): feed examples/workspace-app.yaml
 // through RenderWorkspaceDeployment and confirm the pod security context and
 // the full volume set survive rendering intact.
-// spec.workspace.podSecurityContext.seccompProfile: Unconfined matters most
-// of everything asserted here -- without it bubblewrap's clone/unshare
-// preflight fails and the pod crash-loops, and a renderer that silently
-// drops the field would otherwise ship untested (no other task's render
-// tests exercise this CR at all; Task 5's use a generic fixture).
+// The uid/gid/fsGroup asserted here are the ONLY place those numbers exist:
+// the consumer chart sets no pod securityContext at all and relies on the
+// image's USER directive, so a renderer that silently dropped these fields
+// would break every workspace at once and would otherwise ship untested (no
+// other task's render tests exercise this CR; Task 5's use a generic fixture).
 func TestWorkspaceAppRenderPreservesSecurityContext(t *testing.T) {
 	app := loadWorkspaceAppCR(t)
 	ws := &v1alpha1.Workspace{
@@ -471,9 +550,6 @@ func TestWorkspaceAppRenderPreservesSecurityContext(t *testing.T) {
 	}
 	if psc.FSGroup == nil || wantID.FSGroup == nil || *psc.FSGroup != *wantID.FSGroup {
 		t.Errorf("rendered pod securityContext.fsGroup = %v, want %v", psc.FSGroup, wantID.FSGroup)
-	}
-	if psc.SeccompProfile == nil || psc.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined {
-		t.Fatalf("rendered pod securityContext.seccompProfile = %v, want type Unconfined -- without it bubblewrap's clone/unshare preflight fails and the pod crash-loops", psc.SeccompProfile)
 	}
 
 	gotNames := map[string]bool{}
