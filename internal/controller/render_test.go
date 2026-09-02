@@ -633,8 +633,27 @@ func TestSeederMountsClaimAtStagingPathAndRunsFirst(t *testing.T) {
 	// one, to lay a home skeleton at the volume root). A renderer that
 	// appended "/." itself would take that choice away and flatten every
 	// consumer's corpus to the root permanently.
-	if !strings.Contains(strings.Join(d.Spec.Template.Spec.InitContainers[0].Command, " "), "cp -an /workspace/corpus /mnt/ws/") {
+	if !strings.Contains(strings.Join(d.Spec.Template.Spec.InitContainers[0].Command, " "), "cp -an '/workspace/corpus' '/mnt/ws/'") {
 		t.Fatal("seeder command must pass seed.from through verbatim; appending /. takes the layout choice away from the CR and flattens the corpus to the volume root permanently")
+	}
+	// A seed.from ending in "/." copies into the staging directory ITSELF, so
+	// a single `cp -a` would stamp ownership and timestamps onto the volume's
+	// mount root. fsGroup leaves that root owned by root:<fsGroup> -- group
+	// writable, but not chownable by the workspace user -- so cp exits 1 and
+	// the init container crash-loops before the workspace ever starts. The
+	// entries have to be copied one at a time so the mount root is never
+	// itself a copy target.
+	app.Spec.Storage.Seed = &v1alpha1.SeedSpec{StagingMountPath: "/mnt/ws", From: "/home/skel/."}
+	d = RenderWorkspaceDeployment(app, validWorkspace())
+	seedCmd := strings.Join(d.Spec.Template.Spec.InitContainers[0].Command, " ")
+	if strings.Contains(seedCmd, "cp -an '/home/skel/.' '/mnt/ws/'") {
+		t.Fatal("a trailing-/. seed.from must not be copied with a single cp: -a stamps the mount root, which fsGroup leaves unchownable, and the seeder crash-loops")
+	}
+	if !strings.Contains(seedCmd, `cp -an "$e" '/mnt/ws/'`) {
+		t.Fatal("a trailing-/. seed.from must copy entries individually so the mount root is never a copy target")
+	}
+	if !strings.Contains(seedCmd, "cd '/home/skel/.'") {
+		t.Fatal("the per-entry seeder must cd to seed.from so the entries it globs are the corpus, not the init container's cwd")
 	}
 	// Airgap: the overlay patches imagePullPolicy to Never, and it has to
 	// reach the seeder too. Left at the default, an airgapped node sits in

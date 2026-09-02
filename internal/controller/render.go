@@ -201,7 +201,7 @@ func RenderWorkspaceDeployment(app *v1alpha1.PerUserApp, ws *v1alpha1.Workspace)
 			Name:            seedContainerName,
 			Image:           wt.Image,
 			ImagePullPolicy: wt.ImagePullPolicy,
-			Command:         []string{"sh", "-c", fmt.Sprintf("cp -an %s %s/", seed.From, seed.StagingMountPath)},
+			Command:         []string{"sh", "-c", seedScript(seed.From, seed.StagingMountPath)},
 			VolumeMounts:    []corev1.VolumeMount{{Name: v1alpha1.PVCVolumeName, MountPath: seed.StagingMountPath}},
 		})
 	}
@@ -766,3 +766,43 @@ func ValidateApp(app *v1alpha1.PerUserApp) (warnings []string, err error) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// shellSingleQuote renders s as a single-quoted POSIX shell word so a path
+// from the CR cannot terminate the seeder's command and append its own.
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// seedScript builds the seeder's command. seed.from is passed through
+// verbatim -- the trailing "/." that chooses "loose contents at the volume
+// root" over "under its own directory name" stays the CR author's to write,
+// exactly as before.
+//
+// The two forms cannot share one cp. `cp -an <dir>/. <staging>/` copies into
+// the staging directory ITSELF, so -a's --preserve=all then tries to stamp
+// ownership and timestamps onto the volume's mount root -- which the
+// workspace user does not own, because fsGroup leaves that root owned by
+// root:<fsGroup>, group-writable but not chownable. cp exits 1 and the init
+// container crash-loops before the workspace ever starts. Copying the entries
+// one at a time preserves each entry's own mode (a 0700 .ssh stays 0700,
+// where a plain `cp -r` would leak the mount root's setgid bit into it) while
+// never naming the mount root as a copy target.
+//
+// The bare-path form already creates a CHILD of the staging directory and
+// never touched its metadata, so it keeps the single cp it always had. The
+// choice is made here, at render time, rather than by a shell `case`: the
+// renderer knows which form seed.from is, and emitting only the branch it
+// picked keeps the rendered command readable in a `kubectl get pod -o yaml`.
+func seedScript(from, stagingMountPath string) string {
+	src := shellSingleQuote(from)
+	dst := shellSingleQuote(stagingMountPath + "/")
+	if from == "." || strings.HasSuffix(from, "/.") {
+		// `.[!.]*` and `..?*` are what reach dotfiles, which a bare `*` skips
+		// -- and a home skeleton is very nearly all dotfiles. A pattern that
+		// matches nothing is left unexpanded by the shell, hence the -e test.
+		return fmt.Sprintf(`set -e
+cd %s
+for e in .[!.]* ..?* *; do [ -e "$e" ] || continue; cp -an "$e" %s; done`, src, dst)
+	}
+	return fmt.Sprintf("cp -an %s %s", src, dst)
+}
