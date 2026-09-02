@@ -505,6 +505,9 @@ func RenderRouterDeployment(app *v1alpha1.PerUserApp, routerImage string) (*apps
 		fmt.Sprintf("--listen-addr=:%d", v1alpha1.RouterPort),
 		fmt.Sprintf("--metrics-addr=:%d", v1alpha1.MetricsPort),
 	)
+	for _, p := range app.Spec.Router.SharedPaths {
+		args = append(args, "--shared-path="+p)
+	}
 
 	volumes := []corev1.Volume{secretRefVolume(callerAuthVolumeName, app.Spec.CallerAuth.SecretRef)}
 	mounts := []corev1.VolumeMount{{Name: callerAuthVolumeName, MountPath: callerAuthMountPath, ReadOnly: true}}

@@ -90,3 +90,28 @@ func TestExtractNeverTruncates(t *testing.T) {
 		t.Fatal("over-length identity was accepted; truncation would collide users")
 	}
 }
+
+// TestExtractRejectsTheReservedSharedIdentity: Shared is assigned by a router
+// on a request that arrived with no identity header, never accepted from a
+// caller. Extract is the single chokepoint where that has to hold, since a
+// caller that could claim it would join the shared workspace rather than get
+// one of their own.
+func TestExtractRejectsTheReservedSharedIdentity(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-User-Id", Shared)
+
+	got, err := Extract(h, "X-User-Id", 256)
+	if got != "" {
+		t.Fatalf("got identity %q, want empty", got)
+	}
+	var rej *Rejection
+	if !errors.As(err, &rej) {
+		t.Fatalf("got err %v, want *Rejection", err)
+	}
+	if rej.Reason != ReasonReserved {
+		t.Errorf("got reason %q, want %q", rej.Reason, ReasonReserved)
+	}
+	if rej.Status != http.StatusBadRequest {
+		t.Errorf("got status %d, want 400", rej.Status)
+	}
+}

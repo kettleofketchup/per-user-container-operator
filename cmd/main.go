@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -64,6 +65,18 @@ func run(argv []string) error {
 // The three --upstream-auth-* flags are conditional: they are simply absent
 // from argv when spec.workspace.upstreamAuth is unset on the PerUserApp,
 // and this function must accept that absence rather than requiring them.
+// repeatedString collects a flag that may be given more than once, in the
+// order given. flag has no native repeated-string kind and the alternative —
+// one comma-joined value — would make a path containing a comma unspellable.
+type repeatedString []string
+
+func (r *repeatedString) String() string { return strings.Join(*r, ",") }
+
+func (r *repeatedString) Set(v string) error {
+	*r = append(*r, v)
+	return nil
+}
+
 func parseRouterFlags(args []string) (router.Config, error) {
 	fs := flag.NewFlagSet("router", flag.ContinueOnError)
 
@@ -71,6 +84,8 @@ func parseRouterFlags(args []string) (router.Config, error) {
 	namespace := fs.String("namespace", "", "namespace this router serves")
 	identityHeader := fs.String("identity-header", "", "header carrying the caller's raw identity")
 	identityMaxLength := fs.Int("identity-max-length", 256, "maximum accepted length of the identity header value")
+	var sharedPaths repeatedString
+	fs.Var(&sharedPaths, "shared-path", "exact path served as the reserved shared identity when a GET or HEAD carries no identity header; repeatable")
 	callerAuthHeader := fs.String("caller-auth-header", "", "header carrying the caller's credential")
 	callerAuthScheme := fs.String("caller-auth-scheme", "", "scheme prefix for the caller-auth header value (e.g. Bearer)")
 	callerAuthSecretFile := fs.String("caller-auth-secret-file", "", "path to the mounted caller-auth secret value")
@@ -98,6 +113,12 @@ func parseRouterFlags(args []string) (router.Config, error) {
 		return router.Config{}, errors.New("--caller-auth-header and --caller-auth-secret-file are required: callerAuth is mandatory, never optional")
 	}
 
+	for _, p := range sharedPaths {
+		if !strings.HasPrefix(p, "/") {
+			return router.Config{}, fmt.Errorf("--shared-path %q must be an absolute path beginning with /: it is compared verbatim against the request path, so a relative one could never match", p)
+		}
+	}
+
 	callerSecret, err := router.ReadSecretFile(*callerAuthSecretFile)
 	if err != nil {
 		return router.Config{}, fmt.Errorf("read caller-auth secret file: %w", err)
@@ -108,6 +129,7 @@ func parseRouterFlags(args []string) (router.Config, error) {
 		Namespace:                   *namespace,
 		IdentityHeader:              *identityHeader,
 		IdentityMaxLength:           *identityMaxLength,
+		SharedPaths:                 sharedPaths,
 		CallerAuthHeader:            *callerAuthHeader,
 		CallerAuthScheme:            *callerAuthScheme,
 		CallerAuthSecret:            callerSecret,

@@ -1122,3 +1122,48 @@ func TestRouterServiceAccountAndRoleBindingNamedByConvention(t *testing.T) {
 		t.Fatalf("router RoleBinding subject mismatch: %+v, want ServiceAccount %s/%s", rb.Subjects, app.Namespace, sa.Name)
 	}
 }
+
+// TestRouterDeploymentRendersSharedPathFlags: spec.router.sharedPaths is the
+// operator's only way to reach the router's shared-path behaviour, so every
+// entry must arrive as its own repeated flag, in order. A comma-joined
+// rendering would make a path containing a comma unspellable.
+func TestRouterDeploymentRendersSharedPathFlags(t *testing.T) {
+	app := validApp()
+	app.Spec.Router.SharedPaths = []string{"/openapi.json", "/.well-known/schema"}
+
+	d, err := RenderRouterDeployment(app, testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+
+	var got []string
+	for _, a := range routerContainer(t, d).Args {
+		if v, ok := strings.CutPrefix(a, "--shared-path="); ok {
+			got = append(got, v)
+		}
+	}
+	want := app.Spec.Router.SharedPaths
+	if len(got) != len(want) {
+		t.Fatalf("got %d --shared-path flags %v, want %v", len(got), got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("--shared-path[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestRouterDeploymentOmitsSharedPathFlagWhenUnset: the field is optional and
+// its absence must render no flag at all, leaving the router requiring an
+// identity on every path exactly as it did before the field existed.
+func TestRouterDeploymentOmitsSharedPathFlagWhenUnset(t *testing.T) {
+	d, err := RenderRouterDeployment(validApp(), testRouterImage)
+	if err != nil {
+		t.Fatalf("RenderRouterDeployment: %v", err)
+	}
+	for _, a := range routerContainer(t, d).Args {
+		if strings.HasPrefix(a, "--shared-path") {
+			t.Fatalf("rendered %q with spec.router.sharedPaths unset", a)
+		}
+	}
+}

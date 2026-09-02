@@ -233,3 +233,68 @@ func TestServeAndAwaitShutdownReturnsPromptlyWithNoInFlightRequests(t *testing.T
 		t.Fatal("serveAndAwaitShutdown took far longer than necessary to shut down with no in-flight work")
 	}
 }
+
+// TestParseRouterFlagsCollectsRepeatedSharedPath: the router holds no
+// peruserapps grant, so spec.router.sharedPaths reaches it only as these
+// flags. Each entry must survive as its own value, in order.
+func TestParseRouterFlagsCollectsRepeatedSharedPath(t *testing.T) {
+	callerSecret := writeSecretFile(t, "caller-secret")
+	cfg, err := parseRouterFlags([]string{
+		"--app", "workspace-app",
+		"--namespace", "ns1",
+		"--identity-header", "X-User-Id",
+		"--caller-auth-header", "Authorization",
+		"--caller-auth-secret-file", callerSecret,
+		"--shared-path", "/openapi.json",
+		"--shared-path", "/.well-known/schema",
+	})
+	if err != nil {
+		t.Fatalf("parseRouterFlags: %v", err)
+	}
+	want := []string{"/openapi.json", "/.well-known/schema"}
+	if len(cfg.SharedPaths) != len(want) {
+		t.Fatalf("SharedPaths = %v, want %v", cfg.SharedPaths, want)
+	}
+	for i := range want {
+		if cfg.SharedPaths[i] != want[i] {
+			t.Errorf("SharedPaths[%d] = %q, want %q", i, cfg.SharedPaths[i], want[i])
+		}
+	}
+}
+
+// TestParseRouterFlagsRejectsRelativeSharedPath: a shared path is compared
+// verbatim against the request path, so a relative one could never match and
+// would silently leave the app undiscoverable. Fail at startup instead.
+func TestParseRouterFlagsRejectsRelativeSharedPath(t *testing.T) {
+	callerSecret := writeSecretFile(t, "caller-secret")
+	_, err := parseRouterFlags([]string{
+		"--app", "workspace-app",
+		"--namespace", "ns1",
+		"--identity-header", "X-User-Id",
+		"--caller-auth-header", "Authorization",
+		"--caller-auth-secret-file", callerSecret,
+		"--shared-path", "openapi.json",
+	})
+	if err == nil {
+		t.Fatal("parseRouterFlags accepted a relative --shared-path")
+	}
+}
+
+// TestParseRouterFlagsDefaultsToNoSharedPaths: absent flags must leave the
+// router requiring an identity on every path.
+func TestParseRouterFlagsDefaultsToNoSharedPaths(t *testing.T) {
+	callerSecret := writeSecretFile(t, "caller-secret")
+	cfg, err := parseRouterFlags([]string{
+		"--app", "workspace-app",
+		"--namespace", "ns1",
+		"--identity-header", "X-User-Id",
+		"--caller-auth-header", "Authorization",
+		"--caller-auth-secret-file", callerSecret,
+	})
+	if err != nil {
+		t.Fatalf("parseRouterFlags: %v", err)
+	}
+	if len(cfg.SharedPaths) != 0 {
+		t.Fatalf("SharedPaths = %v, want empty", cfg.SharedPaths)
+	}
+}

@@ -198,3 +198,21 @@ spec:
     # CALL wait out the start instead of erroring. 60 is chosen for that
     # second path; it is not an attempt to beat the 10 s one.
     coldStartHoldSeconds: 60
+    # The spec fetch above happens before the front end has a user: it is
+    # discovering what the app can do, not acting for anybody, so it sends no
+    # identity header and there is no configuration that would make it. Listed
+    # here, that one path is served as the reserved shared user instead of
+    # being refused -- without it the front end concludes the app is
+    # unreachable and every per-user request that would have worked never
+    # happens.
+    #
+    # Exact match, GET/HEAD only, caller auth still required. Keep this list
+    # to user-independent, read-only metadata: a path here is a way into a
+    # real container that nobody had to identify themselves to take.
+    #
+    # The reserved user gets an ordinary workspace, so it is reaped like any
+    # other. The first discovery after a reap pays a cold start against that
+    # 10 s deadline and will usually lose -- the front end retries, and the
+    # retry finds the workspace already running.
+    sharedPaths:
+      - /openapi.json

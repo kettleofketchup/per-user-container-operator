@@ -1,8 +1,11 @@
 // Package identity extracts a caller's identity from an HTTP header and
 // enforces that the extraction is fail-closed: every rejection path returns
 // an empty identity and an error, and there is no success path that yields a
-// shared or default identity. This package has no Kubernetes dependency so
-// its safety properties can be unit-tested in isolation from cluster state.
+// shared or default identity. Substituting the reserved Shared identity for
+// an identity-less request is a router decision made on the request's path,
+// never an outcome Extract can produce. This package has no Kubernetes
+// dependency so its safety properties can be unit-tested in isolation from
+// cluster state.
 package identity
 
 import (
@@ -27,7 +30,17 @@ const (
 	ReasonDuplicate Reason = "duplicate"
 	// ReasonInvalid means the header value contained non-printable-ASCII bytes.
 	ReasonInvalid Reason = "invalid"
+	// ReasonReserved means the header carried Shared, which only the router
+	// may assign and no caller may claim.
+	ReasonReserved Reason = "reserved"
 )
+
+// Shared is the reserved identity a router substitutes for an identity-less
+// request on one of its configured shared paths. Extract never returns it —
+// a caller that supplies it verbatim is rejected as ReasonReserved — so the
+// only way a request can carry this identity is a router's own deliberate
+// substitution, and a user can never steer themselves into its workspace.
+const Shared = "__shared__"
 
 // Rejection is returned by Extract whenever the identity header cannot be
 // trusted. It carries the HTTP status the caller should respond with.
@@ -76,6 +89,13 @@ func Extract(h http.Header, header string, maxLength int) (string, error) {
 		if raw[i] < 0x20 || raw[i] > 0x7e {
 			return reject(ReasonInvalid, http.StatusBadRequest)
 		}
+	}
+	if raw == Shared {
+		// Only a router assigns this, and only for a request that arrived
+		// with no identity header at all. Honouring it from a caller would
+		// let anyone holding the caller credential land in the shared
+		// workspace alongside the app's own metadata traffic.
+		return reject(ReasonReserved, http.StatusBadRequest)
 	}
 	return raw, nil
 }

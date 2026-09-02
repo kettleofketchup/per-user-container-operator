@@ -234,6 +234,33 @@ type RouterSpec struct {
 	Image string `json:"image,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	ColdStartHoldSeconds int32 `json:"coldStartHoldSeconds"`
+
+	// Exact request paths served without an identity header.
+	//
+	// A GET or HEAD that passes caller auth, matches one of these paths
+	// exactly, and carries NO identity header is served as the reserved user
+	// identity.Shared rather than rejected. Nothing downstream is special-
+	// cased: that user gets an ordinary Workspace, holds a
+	// limits.maxWorkspaces slot, and is reaped and reclaimed like any other.
+	//
+	// This exists because a client discovering the app's API has no user in
+	// scope yet — it fetches the schema before it can know whose session it
+	// will open — so that one fetch cannot carry an identity however the
+	// client is configured. Without a path listed here such a client sees
+	// the app as unreachable and every later request fails, even though the
+	// per-user routing behind it works.
+	//
+	// The match is exact and never a prefix. A listed path is a route into a
+	// real container that no user had to identify themselves to reach, so
+	// widening one to a subtree would expose the app's whole surface that
+	// way. List only user-independent, read-only metadata endpoints. Caller
+	// auth remains mandatory here, and a caller that supplies the reserved
+	// identity itself is rejected rather than honoured.
+	//
+	// +kubebuilder:validation:MaxItems=8
+	// +kubebuilder:validation:XValidation:rule="self.all(p, p.startsWith('/'))",message="every sharedPaths entry must be an absolute path beginning with /"
+	// +optional
+	SharedPaths []string `json:"sharedPaths,omitempty"`
 }
 
 // PerUserAppSpec defines the desired state of a PerUserApp.

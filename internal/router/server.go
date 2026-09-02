@@ -60,6 +60,27 @@ func (s *Server) now() time.Time {
 	return time.Now()
 }
 
+// sharedRequest reports whether r is a read-only fetch of one of the exact
+// paths in Cfg.SharedPaths, and so may be served as identity.Shared when it
+// carries no identity header of its own.
+//
+// The comparison is deliberately a plain equality against the unmodified
+// r.URL.Path: an odd spelling of a listed path ("//p", "/./p", "/p/../q")
+// simply fails to match and is rejected as any identity-less request is.
+// Failing to recognise a shared path costs a caller one 401; mistaking some
+// other path for one would hand it out without a user attached.
+func (s *Server) sharedRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	for _, p := range s.Cfg.SharedPaths {
+		if r.URL.Path == p {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) pollInterval() time.Duration {
 	if s.PollInterval > 0 {
 		return s.PollInterval
@@ -88,14 +109,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	raw, err := identity.Extract(r.Header, s.Cfg.IdentityHeader, s.Cfg.IdentityMaxLength)
 	if err != nil {
 		var rej *identity.Rejection
-		if errors.As(err, &rej) {
+		switch {
+		case errors.As(err, &rej) && rej.Reason == identity.ReasonMissing && s.sharedRequest(r):
+			// Only a MISSING header is substituted. Empty, duplicate,
+			// over-long and non-ASCII values are all shapes a header takes
+			// when something is trying to be somebody, and a shared path is
+			// exactly where that would be worth trying — so they keep
+			// failing here as they do everywhere else.
+			raw = identity.Shared
+		case errors.As(err, &rej):
 			metrics.RecordIdentityRejection(ns, app, rej.Reason)
 			s.reject(rec, rej.Status, "identity rejected: "+string(rej.Reason))
-		} else {
+			metrics.RecordRouterRequest(ns, app, strconv.Itoa(rec.code()))
+			return
+		default:
 			s.reject(rec, http.StatusUnauthorized, "identity rejected")
+			metrics.RecordRouterRequest(ns, app, strconv.Itoa(rec.code()))
+			return
 		}
-		metrics.RecordRouterRequest(ns, app, strconv.Itoa(rec.code()))
-		return
 	}
 
 	userKey := identity.UserKey(ns, app, raw)

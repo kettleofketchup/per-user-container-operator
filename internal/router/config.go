@@ -17,6 +17,13 @@ type Config struct {
 	IdentityHeader    string
 	IdentityMaxLength int
 
+	// SharedPaths mirrors spec.router.sharedPaths: the exact paths on which
+	// a GET or HEAD arriving with no identity header is served as
+	// identity.Shared instead of rejected. Empty (the default) means every
+	// path requires an identity, which is the behaviour every app had before
+	// this field existed.
+	SharedPaths []string
+
 	CallerAuthHeader string
 	CallerAuthScheme string
 	CallerAuthSecret []byte

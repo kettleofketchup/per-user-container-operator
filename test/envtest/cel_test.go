@@ -244,3 +244,44 @@ func TestReclaimCELRulesAreEnforcedByTheAPIServer(t *testing.T) {
 		})
 	}
 }
+
+// TestSharedPathsCELRequiresAbsolutePaths: a sharedPaths entry is compared
+// verbatim against the request path, so a relative one can never match and
+// would leave the app quietly undiscoverable rather than visibly misconfigured.
+// The API server is what has to catch that.
+func TestSharedPathsCELRequiresAbsolutePaths(t *testing.T) {
+	ns := newNamespace(t)
+
+	ok := validAppFor(ns)
+	ok.Name = "shared-ok"
+	ok.Spec.Router.SharedPaths = []string{"/openapi.json", "/.well-known/schema"}
+	if err := k8sClient.Create(context.Background(), ok); err != nil {
+		t.Fatalf("absolute sharedPaths must be accepted: %v", err)
+	}
+
+	bad := validAppFor(ns)
+	bad.Name = "shared-bad"
+	bad.Spec.Router.SharedPaths = []string{"/openapi.json", "openapi.json"}
+	err := k8sClient.Create(context.Background(), bad)
+	if err == nil {
+		t.Fatal("a relative sharedPaths entry must be rejected")
+	}
+	if !strings.Contains(err.Error(), "absolute path") {
+		t.Fatalf("rejection must name the absolute-path requirement, got: %v", err)
+	}
+}
+
+// TestSharedPathsIsOptional: the field was added after the CRD shipped, so
+// every existing PerUserApp that omits it must still be accepted.
+func TestSharedPathsIsOptional(t *testing.T) {
+	ns := newNamespace(t)
+	app := validAppFor(ns)
+	if err := k8sClient.Create(context.Background(), app); err != nil {
+		t.Fatalf("omitting sharedPaths must be accepted: %v", err)
+	}
+	var got v1alpha1.PerUserApp
+	mustGetObj(t, client.ObjectKeyFromObject(app), &got)
+	if len(got.Spec.Router.SharedPaths) != 0 {
+		t.Fatalf("SharedPaths defaulted to %v, want empty", got.Spec.Router.SharedPaths)
+	}
+}
