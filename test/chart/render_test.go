@@ -409,6 +409,31 @@ func TestClusterRoleCoversLeaderElectionAndStorageClassesOnly(t *testing.T) {
 		}
 	}
 
+	// persistentvolumes, cluster-scoped for exactly the same reason and with
+	// the same placement rule. The Reclaimer flips a bound volume's
+	// persistentVolumeReclaimPolicy to Delete before releasing the claim,
+	// which is the only thing that makes reclaim.deleteVolumeData free any
+	// disk at all.
+	pvVerbs := ruleVerbs(rules, "", "persistentvolumes")
+	if pvVerbs == nil {
+		t.Fatal("ClusterRole has no rule for core/persistentvolumes -- reclaim.deleteVolumeData fails closed on every sweep, and an operator who set it reads \"enabled\" while nothing is ever freed")
+	}
+	for _, v := range []string{"get", "list", "watch", "patch"} {
+		if !containsStr(pvVerbs, v) {
+			t.Errorf("ClusterRole core/persistentvolumes missing verb %q, got %v", v, pvVerbs)
+		}
+	}
+	// create and delete are deliberately withheld: the Reclaimer never makes
+	// or removes a PersistentVolume object, it re-policies one and lets the
+	// CSI driver destroy the volume on release. Deleting the PV directly
+	// would orphan the backing image instead of freeing it -- strictly more
+	// privilege for strictly the wrong outcome.
+	for _, v := range []string{"create", "delete"} {
+		if containsStr(pvVerbs, v) {
+			t.Errorf("ClusterRole grants core/persistentvolumes %q; the Reclaimer only patches the reclaim policy, and deleting a PV orphans its backing volume rather than freeing it", v)
+		}
+	}
+
 	if ruleVerbs(rules, "coordination.k8s.io", "leases") == nil {
 		t.Error("ClusterRole has no rule for coordination.k8s.io/leases (leader election)")
 	}
@@ -433,6 +458,9 @@ func TestClusterRoleCoversLeaderElectionAndStorageClassesOnly(t *testing.T) {
 	for _, r := range set.roles {
 		if ruleVerbs(r.Rules, "storage.k8s.io", "storageclasses") != nil {
 			t.Errorf("namespaced Role %s/%s grants storage.k8s.io/storageclasses -- this must live ONLY on the ClusterRole; a namespaced grant on a cluster-scoped resource silently fails at authorization time even though SelfSubjectAccessReview says Allowed", r.Namespace, r.Name)
+		}
+		if ruleVerbs(r.Rules, "", "persistentvolumes") != nil {
+			t.Errorf("namespaced Role %s/%s grants core/persistentvolumes -- same trap: cluster-scoped, so a namespaced grant authorizes nothing while reading as if it does", r.Namespace, r.Name)
 		}
 	}
 }

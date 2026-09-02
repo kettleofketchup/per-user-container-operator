@@ -529,6 +529,72 @@ spec:
                     the router'
                   rule: self.workspaceEgress.all(r, r.to.size() > 0 && r.to.all(p,
                     has(p.ipBlock) || has(p.podSelector) || has(p.namespaceSelector)))
+              reclaim:
+                description: |-
+                  Absent means no workspace is ever reclaimed and no user's data is ever
+                  deleted, which is why this is the one spec field with no default value
+                  at all rather than a disabled-by-default struct.
+                properties:
+                  deleteVolumeData:
+                    default: false
+                    description: |-
+                      What reclamation actually frees.
+
+                      false (the default): the Workspace and its PVC are deleted and nothing
+                      else. Because the operator only accepts Retain-reclaim StorageClasses,
+                      the bound PersistentVolume survives in phase Released with the backing
+                      volume intact — the user's files are still recoverable by hand, and NO
+                      disk space is freed. This reclaims the limits.maxWorkspaces slot, not
+                      the storage.
+
+                      true: the bound PersistentVolume's persistentVolumeReclaimPolicy is
+                      patched from Retain to Delete BEFORE the PVC is deleted, so releasing
+                      it makes the CSI driver destroy the backing volume. This is the only
+                      setting that frees disk, and it is IRREVERSIBLE: once the driver has
+                      deleted the image there is nothing left to rebind. It also requires the
+                      controller to hold patch on the cluster-scoped persistentvolumes
+                      resource; without that grant a sweep fails closed and deletes neither
+                      the claim nor the volume, rather than deleting the claim and silently
+                      freeing nothing.
+                    type: boolean
+                  enabled:
+                    default: false
+                    description: |-
+                      Off unless explicitly turned on. An operator adopting this API must
+                      opt into data deletion in the same commit that sets the thresholds,
+                      rather than inheriting it from a default.
+                    type: boolean
+                  interval:
+                    description: |-
+                      How often a sweep runs, gated per app exactly as lifecycle.reapInterval
+                      gates the Reaper.
+                    type: string
+                  minIdleAge:
+                    description: |-
+                      The absolute floor: a workspace whose status.lastActivity is more
+                      recent than this is never a candidate, however far over target the app
+                      is. If every workspace is fresher than minIdleAge the sweep reclaims
+                      NOTHING and the app stays over target — deliberately, because the
+                      alternative is deleting the files of somebody who used the app this
+                      morning to make room for somebody who wants it now.
+                    type: string
+                  targetWorkspaces:
+                    description: |-
+                      The workspace count a sweep reclaims down to. Must be strictly below
+                      limits.maxWorkspaces (enforced by CEL on PerUserAppSpec).
+                    format: int32
+                    minimum: 1
+                    type: integer
+                required:
+                - enabled
+                - interval
+                - minIdleAge
+                - targetWorkspaces
+                type: object
+                x-kubernetes-validations:
+                - message: minIdleAge must exceed interval, or a single sweep can
+                    reclaim a workspace that went idle between two ticks
+                  rule: duration(self.minIdleAge) > duration(self.interval)
               router:
                 description: RouterSpec configures the shared router Deployment for
                   this app.
@@ -4963,6 +5029,15 @@ spec:
             - storage
             - workspace
             type: object
+            x-kubernetes-validations:
+            - message: 'reclaim.targetWorkspaces must be strictly below limits.maxWorkspaces:
+                at equal values reclamation only starts once the router is already
+                refusing users with 503 workspace_limit'
+              rule: '!has(self.reclaim) || self.reclaim.targetWorkspaces < self.limits.maxWorkspaces'
+            - message: 'reclaim.minIdleAge must exceed lifecycle.idleTimeout: a floor
+                below it would delete the files of a user the reaper had only just
+                scaled down'
+              rule: '!has(self.reclaim) || duration(self.reclaim.minIdleAge) > duration(self.lifecycle.idleTimeout)'
           status:
             description: PerUserAppStatus defines the observed state of a PerUserApp.
             properties:

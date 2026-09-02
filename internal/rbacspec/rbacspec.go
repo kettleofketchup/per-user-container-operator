@@ -28,8 +28,8 @@ import "github.com/kettleofketchup/per-user-container-operator/api/v1alpha1"
 // probe attempts in a served namespace, and the chart's rendered Role (or
 // ClusterRole, for ClusterScoped entries) must grant.
 //
-// ClusterScoped marks a resource that is NOT namespaced (storageclasses is
-// the only one today). This field exists specifically so a cluster-scoped
+// ClusterScoped marks a resource that is NOT namespaced (storageclasses and
+// persistentvolumes). This field exists specifically so a cluster-scoped
 // addition is a deliberate, visible choice at the call site, not a string
 // some future reader has to recognize by name: a SelfSubjectAccessReview
 // evaluates exactly the hypothesis it is handed, and a NAMESPACED Role
@@ -46,11 +46,17 @@ type NamespaceCheck struct {
 
 // ControllerNamespaceChecks mirrors every +kubebuilder:rbac marker across
 // WorkspaceReconciler and PerUserAppReconciler: the verbs each actually
-// uses, per resource. Every entry here is namespaced EXCEPT the three
-// storageclasses checks, marked ClusterScoped: true -- storage.k8s.io
-// StorageClass is spec 556's one stated exception to "nothing else is
-// cluster-scoped," and the chart grants it via a ClusterRole rather than
-// the per-namespace Role this list otherwise probes.
+// uses, per resource. Every entry here is namespaced EXCEPT the checks
+// marked ClusterScoped: true, which the chart grants via a ClusterRole
+// rather than the per-namespace Role this list otherwise probes. Those are
+// storageclasses -- spec 556's one stated exception to "nothing else is
+// cluster-scoped," read to reject a Delete-reclaim class -- and
+// persistentvolumes, which the Reclaimer patches (never creates, never
+// deletes) to flip a bound volume's reclaim policy before releasing it.
+// persistentvolumes is granted unconditionally rather than only when some
+// app sets reclaim.deleteVolumeData, because RBAC is rendered once per
+// cluster while that field is per app: gating it would mean a chart whose
+// grants depend on CRs installed after it.
 var ControllerNamespaceChecks = []NamespaceCheck{
 	{Group: v1alpha1.GroupVersion.Group, Resource: "peruserapps", Verb: "get"},
 	{Group: v1alpha1.GroupVersion.Group, Resource: "peruserapps", Verb: "list"},
@@ -87,6 +93,7 @@ var ControllerNamespaceChecks = []NamespaceCheck{
 	{Group: "", Resource: "persistentvolumeclaims", Verb: "create"},
 	{Group: "", Resource: "persistentvolumeclaims", Verb: "update"},
 	{Group: "", Resource: "persistentvolumeclaims", Verb: "patch"},
+	{Group: "", Resource: "persistentvolumeclaims", Verb: "delete"},
 	{Group: "", Resource: "pods", Verb: "get"},
 	{Group: "", Resource: "pods", Verb: "list"},
 	{Group: "", Resource: "pods", Verb: "watch"},
@@ -113,4 +120,8 @@ var ControllerNamespaceChecks = []NamespaceCheck{
 	{Group: "storage.k8s.io", Resource: "storageclasses", Verb: "get", ClusterScoped: true},
 	{Group: "storage.k8s.io", Resource: "storageclasses", Verb: "list", ClusterScoped: true},
 	{Group: "storage.k8s.io", Resource: "storageclasses", Verb: "watch", ClusterScoped: true},
+	{Group: "", Resource: "persistentvolumes", Verb: "get", ClusterScoped: true},
+	{Group: "", Resource: "persistentvolumes", Verb: "list", ClusterScoped: true},
+	{Group: "", Resource: "persistentvolumes", Verb: "watch", ClusterScoped: true},
+	{Group: "", Resource: "persistentvolumes", Verb: "patch", ClusterScoped: true},
 }

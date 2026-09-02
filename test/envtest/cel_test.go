@@ -9,6 +9,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -149,5 +150,97 @@ func TestWorkspaceUserKeyIsImmutable(t *testing.T) {
 	current.Spec.UserKey = "u-0000000000000000"
 	if err := k8sClient.Patch(context.Background(), &current, client.MergeFrom(base)); err == nil {
 		t.Fatal("spec.userKey must be immutable after create")
+	}
+}
+
+// TestReclaimCELRulesAreEnforcedByTheAPIServer covers the three cross-field
+// rules guarding the one API in this operator that destroys user data. All
+// three are CEL because none is expressible as a per-field bound: each
+// compares two fields that live in different structs, and Go-side validation
+// would let a bad CR sit admitted in etcd until a controller happened to read
+// it -- by which time the reclaim loop is already running against it.
+func TestReclaimCELRulesAreEnforcedByTheAPIServer(t *testing.T) {
+	ns := newNamespace(t)
+
+	sane := func() *v1alpha1.ReclaimSpec {
+		return &v1alpha1.ReclaimSpec{
+			Enabled:          true,
+			TargetWorkspaces: 3,
+			MinIdleAge:       metav1.Duration{Duration: 24 * time.Hour},
+			Interval:         metav1.Duration{Duration: time.Hour},
+		}
+	}
+
+	// The whole struct is optional: absence must remain admissible, since
+	// that is what "no workspace is ever reclaimed" looks like on the wire.
+	absent := validAppFor(ns)
+	absent.Name = "reclaim-absent"
+	if err := k8sClient.Create(context.Background(), absent); err != nil {
+		t.Fatalf("an app with no spec.reclaim must be accepted: %v", err)
+	}
+
+	ok := validAppFor(ns)
+	ok.Name = "reclaim-ok"
+	ok.Spec.Limits.MaxWorkspaces = 10
+	ok.Spec.Reclaim = sane()
+	if err := k8sClient.Create(context.Background(), ok); err != nil {
+		t.Fatalf("a well-formed reclaim spec must be accepted: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		mutate  func(*v1alpha1.PerUserApp)
+		wantMsg string
+	}{
+		{
+			// At equal values the first sweep only runs once the app is
+			// already at its hard cap, i.e. once the router is already
+			// answering 503 workspace_limit -- reclamation would start at
+			// the outage it exists to prevent.
+			name: "target equal to the hard cap",
+			mutate: func(a *v1alpha1.PerUserApp) {
+				a.Spec.Limits.MaxWorkspaces = 3
+				a.Spec.Reclaim = sane()
+			},
+			wantMsg: "strictly below limits.maxWorkspaces",
+		},
+		{
+			// A floor at or below idleTimeout deletes the files of a user
+			// the Reaper had only just scaled down.
+			name: "idle floor below the reap timeout",
+			mutate: func(a *v1alpha1.PerUserApp) {
+				a.Spec.Limits.MaxWorkspaces = 10
+				a.Spec.Lifecycle.IdleTimeout = metav1.Duration{Duration: 2 * time.Hour}
+				a.Spec.Reclaim = sane()
+				a.Spec.Reclaim.MinIdleAge = metav1.Duration{Duration: time.Hour}
+			},
+			wantMsg: "must exceed lifecycle.idleTimeout",
+		},
+		{
+			// With a sweep interval longer than the floor, a workspace can
+			// cross minIdleAge and be reclaimed within a single tick of
+			// having gone idle.
+			name: "sweep interval longer than the idle floor",
+			mutate: func(a *v1alpha1.PerUserApp) {
+				a.Spec.Limits.MaxWorkspaces = 10
+				a.Spec.Reclaim = sane()
+				a.Spec.Reclaim.MinIdleAge = metav1.Duration{Duration: time.Hour}
+				a.Spec.Reclaim.Interval = metav1.Duration{Duration: 2 * time.Hour}
+			},
+			wantMsg: "minIdleAge must exceed interval",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := validAppFor(ns)
+			bad.Name = "reclaim-bad-" + strings.ReplaceAll(tc.name, " ", "-")
+			tc.mutate(bad)
+			err := k8sClient.Create(context.Background(), bad)
+			if err == nil {
+				t.Fatalf("%s must be rejected by CEL", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("rejection must explain the failure mode (want %q), got: %v", tc.wantMsg, err)
+			}
+		})
 	}
 }

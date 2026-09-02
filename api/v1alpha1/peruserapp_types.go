@@ -159,6 +159,72 @@ type LifecycleSpec struct {
 	ConnectionHeartbeatInterval metav1.Duration `json:"connectionHeartbeatInterval"`
 }
 
+// ReclaimSpec configures least-recently-used reclamation of per-user
+// storage. It is the ONLY part of this API that destroys a user's data, so
+// it is absent by default and every clause below is a floor rather than a
+// target: a workspace is reclaimed only when the app is over
+// targetWorkspaces AND that workspace has been idle longer than minIdleAge
+// AND it is already scaled down. Widening any one clause alone reclaims
+// nothing extra.
+//
+// The two count knobs are deliberately different things. limits.maxWorkspaces
+// is a HARD refusal — the router answers 503 workspace_limit at it, and the
+// admission gate never exceeds it. targetWorkspaces is the level reclamation
+// restores the app to, and must sit strictly below the hard cap: equal values
+// would mean the first reclaim pass only runs once the app is already
+// refusing users, which is the outage this exists to prevent.
+//
+// +kubebuilder:validation:XValidation:rule="duration(self.minIdleAge) > duration(self.interval)",message="minIdleAge must exceed interval, or a single sweep can reclaim a workspace that went idle between two ticks"
+type ReclaimSpec struct {
+	// Off unless explicitly turned on. An operator adopting this API must
+	// opt into data deletion in the same commit that sets the thresholds,
+	// rather than inheriting it from a default.
+	//
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled"`
+
+	// The workspace count a sweep reclaims down to. Must be strictly below
+	// limits.maxWorkspaces (enforced by CEL on PerUserAppSpec).
+	//
+	// +kubebuilder:validation:Minimum=1
+	TargetWorkspaces int32 `json:"targetWorkspaces"`
+
+	// The absolute floor: a workspace whose status.lastActivity is more
+	// recent than this is never a candidate, however far over target the app
+	// is. If every workspace is fresher than minIdleAge the sweep reclaims
+	// NOTHING and the app stays over target — deliberately, because the
+	// alternative is deleting the files of somebody who used the app this
+	// morning to make room for somebody who wants it now.
+	MinIdleAge metav1.Duration `json:"minIdleAge"`
+
+	// How often a sweep runs, gated per app exactly as lifecycle.reapInterval
+	// gates the Reaper.
+	Interval metav1.Duration `json:"interval"`
+
+	// What reclamation actually frees.
+	//
+	// false (the default): the Workspace and its PVC are deleted and nothing
+	// else. Because the operator only accepts Retain-reclaim StorageClasses,
+	// the bound PersistentVolume survives in phase Released with the backing
+	// volume intact — the user's files are still recoverable by hand, and NO
+	// disk space is freed. This reclaims the limits.maxWorkspaces slot, not
+	// the storage.
+	//
+	// true: the bound PersistentVolume's persistentVolumeReclaimPolicy is
+	// patched from Retain to Delete BEFORE the PVC is deleted, so releasing
+	// it makes the CSI driver destroy the backing volume. This is the only
+	// setting that frees disk, and it is IRREVERSIBLE: once the driver has
+	// deleted the image there is nothing left to rebind. It also requires the
+	// controller to hold patch on the cluster-scoped persistentvolumes
+	// resource; without that grant a sweep fails closed and deletes neither
+	// the claim nor the volume, rather than deleting the claim and silently
+	// freeing nothing.
+	//
+	// +kubebuilder:default=false
+	// +optional
+	DeleteVolumeData bool `json:"deleteVolumeData,omitempty"`
+}
+
 // RouterSpec configures the shared router Deployment for this app.
 type RouterSpec struct {
 	// +kubebuilder:default=2
@@ -171,6 +237,9 @@ type RouterSpec struct {
 }
 
 // PerUserAppSpec defines the desired state of a PerUserApp.
+//
+// +kubebuilder:validation:XValidation:rule="!has(self.reclaim) || self.reclaim.targetWorkspaces < self.limits.maxWorkspaces",message="reclaim.targetWorkspaces must be strictly below limits.maxWorkspaces: at equal values reclamation only starts once the router is already refusing users with 503 workspace_limit"
+// +kubebuilder:validation:XValidation:rule="!has(self.reclaim) || duration(self.reclaim.minIdleAge) > duration(self.lifecycle.idleTimeout)",message="reclaim.minIdleAge must exceed lifecycle.idleTimeout: a floor below it would delete the files of a user the reaper had only just scaled down"
 type PerUserAppSpec struct {
 	Identity IdentitySpec `json:"identity"`
 	// Mandatory, never optional. Anyone who can reach the router directly can
@@ -183,6 +252,12 @@ type PerUserAppSpec struct {
 	Limits     LimitsSpec            `json:"limits"`
 	Lifecycle  LifecycleSpec         `json:"lifecycle"`
 	Router     RouterSpec            `json:"router"`
+	// Absent means no workspace is ever reclaimed and no user's data is ever
+	// deleted, which is why this is the one spec field with no default value
+	// at all rather than a disabled-by-default struct.
+	//
+	// +optional
+	Reclaim *ReclaimSpec `json:"reclaim,omitempty"`
 }
 
 // PerUserAppStatus defines the observed state of a PerUserApp.

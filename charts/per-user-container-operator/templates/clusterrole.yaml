@@ -35,3 +35,19 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
+  {{/*
+  persistentvolumes, same argument as storageclasses and same placement: a
+  PersistentVolume is cluster-scoped, so this grant belongs ONLY here and
+  never in the per-namespace Role, where it would answer a namespaced
+  SelfSubjectAccessReview Allowed:true while every real Get is Forbidden.
+
+  The verbs stop at patch on purpose. The Reclaimer flips a bound volume's
+  persistentVolumeReclaimPolicy from Retain to Delete and then deletes the
+  CLAIM, letting the CSI driver destroy the volume on release; it never
+  creates or deletes a PersistentVolume object itself. Granting delete here
+  would let the controller remove a PV while leaving its backing image
+  orphaned -- strictly more privilege, and the wrong mechanism.
+  */}}
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "patch"]

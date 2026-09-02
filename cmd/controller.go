@@ -309,6 +309,10 @@ func runController(args []string) error {
 		return fmt.Errorf("setup reaper: %w", err)
 	}
 
+	if err := controller.NewReclaimer(mgr.GetClient()).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("setup reclaimer: %w", err)
+	}
+
 	go func() {
 		<-mgr.Elected()
 		leaderless := computeLeaderless(time.Now(), snap, cfg.PodName)
