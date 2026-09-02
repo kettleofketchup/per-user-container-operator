@@ -31,6 +31,20 @@ const (
 	// this operator formed, so the sweep finishes only work it started.
 	AnnReclaiming = "puc.kettleofketchup/reclaiming"
 
+	// AnnSpecHash records the rendered workspace Deployment spec this
+	// operator last wrote, so ensureDeployment can tell a spec that drifted
+	// from one that merely looks different because the API server defaulted
+	// it. Without the stamp the reconciler has two equally wrong choices:
+	// never update an existing Deployment -- which strands every workspace
+	// created before a PerUserApp change, since a user's Deployment is
+	// created once and then lives for as long as the user does -- or diff
+	// the live object against the render, where every server-defaulted field
+	// the render leaves empty reads as a difference and the workspace rolls
+	// on every reconcile forever. The hash covers the spec with replicas
+	// normalized away: scaling to zero and back is this operator's own idle
+	// cycle, not a template change, and must not read as one.
+	AnnSpecHash = "puc.kettleofketchup/spec-hash"
+
 	ComponentRouter    = "router"
 	ComponentWorkspace = "workspace"
 	// ComponentController identifies the controller's own metrics Service and

@@ -326,7 +326,7 @@ func (r *WorkspaceReconciler) reconcilePending(ctx context.Context, ws *v1alpha1
 		if !apierrors.IsAlreadyExists(err) {
 			return ctrl.Result{}, err
 		}
-		if err := r.ensureReplicas(ctx, ws, app, 1); err != nil {
+		if err := r.ensureDeployment(ctx, ws, app, 1); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -491,7 +491,7 @@ func (r *WorkspaceReconciler) reconcileReady(ctx context.Context, ws *v1alpha1.W
 	}
 
 	if ws.Status.ScaledDown {
-		if err := r.ensureReplicas(ctx, ws, app, 0); err != nil {
+		if err := r.ensureDeployment(ctx, ws, app, 0); err != nil {
 			return ctrl.Result{}, err
 		}
 		var pods corev1.PodList
@@ -565,11 +565,24 @@ func (r *WorkspaceReconciler) ensureWorkspaceNetworkPolicies(ctx context.Context
 	return nil
 }
 
-// ensureReplicas is the only place in this reconciler that writes
-// Deployment.spec.replicas. It patches only that field: RenderWorkspaceDeployment
-// is still the source of truth for everything else, but a blind
-// re-Create/Update would fight other fields with no benefit here.
-func (r *WorkspaceReconciler) ensureReplicas(ctx context.Context, ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp, want int32) error {
+// ensureDeployment is the only place in this reconciler that writes an
+// existing workspace Deployment's spec. A user's Deployment is created once
+// and then lives for as long as the user does, so patching replicas alone --
+// which is all this used to do -- stranded every workspace that predated a
+// PerUserApp or chart change: a new image, mount or resource limit reached
+// new users only, and the fleet silently forked in two.
+//
+// It runs at the two points that already move replicas, and only there: going
+// idle (want=0) and being admitted again (want=1). Both are moments the pod is
+// being destroyed or created anyway, so bringing the template along costs no
+// disruption a running session would notice. Reconciling the spec on every
+// pass would instead restart a workspace out from under whoever is using it.
+//
+// The AnnSpecHash comparison, not a diff of the live object, decides whether
+// the spec is stale. Diffing would compare a render that leaves dozens of
+// fields empty against a live object the API server has defaulted, read the
+// defaults as drift, and roll the workspace on every reconcile forever.
+func (r *WorkspaceReconciler) ensureDeployment(ctx context.Context, ws *v1alpha1.Workspace, app *v1alpha1.PerUserApp, want int32) error {
 	name := identity.ChildName(app.Name, ws.Spec.UserKey)
 	var dep appsv1.Deployment
 	if err := r.Get(ctx, types.NamespacedName{Namespace: ws.Namespace, Name: name}, &dep); err != nil {
@@ -578,10 +591,28 @@ func (r *WorkspaceReconciler) ensureReplicas(ctx context.Context, ws *v1alpha1.W
 		}
 		return err
 	}
-	if dep.Spec.Replicas != nil && *dep.Spec.Replicas == want {
+
+	desired := RenderWorkspaceDeployment(app, ws)
+	hash := desired.Annotations[v1alpha1.AnnSpecHash]
+	stale := dep.Annotations[v1alpha1.AnnSpecHash] != hash
+	scaled := dep.Spec.Replicas == nil || *dep.Spec.Replicas != want
+	if !stale && !scaled {
 		return nil
 	}
+
 	patch := client.MergeFrom(dep.DeepCopy())
+	if stale {
+		spec := *desired.Spec.DeepCopy()
+		// spec.selector is immutable after creation; carrying the live value
+		// forward keeps the patch from ever proposing a change to it, even if
+		// a future render derives the labels differently.
+		spec.Selector = dep.Spec.Selector
+		dep.Spec = spec
+		if dep.Annotations == nil {
+			dep.Annotations = map[string]string{}
+		}
+		dep.Annotations[v1alpha1.AnnSpecHash] = hash
+	}
 	dep.Spec.Replicas = &want
 	return r.Patch(ctx, &dep, patch)
 }

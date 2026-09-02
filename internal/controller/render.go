@@ -6,6 +6,8 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -242,7 +244,26 @@ func RenderWorkspaceDeployment(app *v1alpha1.PerUserApp, ws *v1alpha1.Workspace)
 			},
 		},
 	}
+	d.Annotations = map[string]string{v1alpha1.AnnSpecHash: WorkspaceSpecHash(d)}
 	return d
+}
+
+// WorkspaceSpecHash fingerprints a rendered workspace Deployment spec so
+// ensureDeployment can recognise a real template change. Replicas is
+// normalized out before hashing: it is the one field the reconciler drives on
+// its own (idle scales to zero, admission back to one), so leaving it in
+// would make every idle cycle look like a template change.
+//
+// The input is always a freshly rendered Deployment, never one read back from
+// the API server, so the hash never picks up server-defaulted fields.
+func WorkspaceSpecHash(d *appsv1.Deployment) string {
+	spec := *d.Spec.DeepCopy()
+	spec.Replicas = nil
+	// json.Marshal on a Kubernetes API struct cannot fail: every field is a
+	// JSON-tagged value type. Ignoring the error keeps this function pure and
+	// callable from the render path, which has nowhere to return one.
+	b, _ := json.Marshal(spec)
+	return fmt.Sprintf("%x", sha256.Sum256(b))
 }
 
 // RenderWorkspaceService renders the ClusterIP Service fronting one user's
