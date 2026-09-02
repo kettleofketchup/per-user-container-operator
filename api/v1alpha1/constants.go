@@ -19,6 +19,18 @@ const (
 	LabelComponent = "puc.kettleofketchup/component"
 	AnnUserDisplay = "puc.kettleofketchup/user-display"
 
+	// AnnReclaiming is stamped on a PersistentVolumeClaim by the Reclaimer
+	// immediately before it deletes the owning Workspace, and is the ONLY
+	// thing that makes a per-user claim eligible for deletion by the sweep in
+	// reclaimOrphanedPVCs. Reclaiming a workspace touches two objects that
+	// cannot be deleted atomically, so a crash between them leaves a claim
+	// whose Workspace is gone: without a marker the sweep would have to infer
+	// "no Workspace" means "abandoned", which is exactly false for a claim
+	// pre-seeded by a migration before its Workspace exists -- and inferring
+	// it would delete a user's migrated files. The stamp records an intent
+	// this operator formed, so the sweep finishes only work it started.
+	AnnReclaiming = "puc.kettleofketchup/reclaiming"
+
 	ComponentRouter    = "router"
 	ComponentWorkspace = "workspace"
 	// ComponentController identifies the controller's own metrics Service and
@@ -107,8 +119,16 @@ const (
 	StartFailureCrash    = "crashloop"
 )
 
-// ReapReasonIdle is the sole puc_workspace_reaped_total{reason} value — closed set.
-const ReapReasonIdle = "idle"
+// puc_workspace_reaped_total{reason} — closed set. The two values are
+// different events on the same workspace and must never be conflated: "idle"
+// is the Reaper scaling a pod to zero, which is reversible and loses nothing,
+// while "lru" is the Reclaimer deleting the Workspace and its claim, which is
+// not. A dashboard summing the metric without splitting on reason reads a
+// harmless scale-down and a data deletion as the same number.
+const (
+	ReapReasonIdle = "idle"
+	ReapReasonLRU  = "lru"
+)
 
 // puc_router_request_rejected_total{reason} — closed set, disjoint from the
 // identity reasons in internal/identity. The same string goes in the 503
